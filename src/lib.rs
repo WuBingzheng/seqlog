@@ -92,7 +92,7 @@ impl SeqLog {
     //   +---------------------------------+
     //
     // The @len is 16-bit, and the last one is set the highest bit.
-    pub fn append<T>(&mut self, entries: &[T]) -> Result<()>
+    pub fn append<T>(&mut self, entries: &[T], sync: bool) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
@@ -107,7 +107,7 @@ impl SeqLog {
         let dummy = IoSlice::new(&DUMMY);
 
         // new segment
-        segment_index.push((io_slices.len(), lengths.len(), 0));
+        segment_index.push((io_slices.len(), lengths.len(), lengths.len()));
         io_slices.push(dummy); // hold the place for lengths
 
         // iterate entries
@@ -137,8 +137,10 @@ impl SeqLog {
                 }
 
                 // close current segment
-                *lengths.last_mut().unwrap() |= LAST_LEN_FLAG;
-                segment_index.last_mut().unwrap().2 = lengths.len();
+                if let Some(last_len) = lengths.last_mut() {
+                    *last_len |= LAST_LEN_FLAG;
+                    segment_index.last_mut().unwrap().2 = lengths.len();
+                }
 
                 // new block
                 start_seqs.push(self.next_seq);
@@ -160,8 +162,10 @@ impl SeqLog {
         }
 
         // close the last segment
-        *lengths.last_mut().unwrap() |= LAST_LEN_FLAG;
-        segment_index.last_mut().unwrap().2 = lengths.len();
+        if let Some(last_len) = lengths.last_mut() {
+            *last_len |= LAST_LEN_FLAG;
+            segment_index.last_mut().unwrap().2 = lengths.len();
+        }
 
         // fix the io_slices for segments header: lengths
         for (slci, len_start, len_end) in segment_index.into_iter() {
@@ -175,7 +179,9 @@ impl SeqLog {
 
         // finally, write into file and sync
         self.current.write_vectored(&io_slices)?;
-        self.current.sync_data()?;
+        if sync {
+            self.current.sync_data()?;
+        }
         Ok(())
     }
 

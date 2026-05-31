@@ -25,7 +25,7 @@ fn main() {
 
     let start = Instant::now();
     for _ in 0..2 {
-        seqlog.append(&entries).unwrap();
+        seqlog.append(&entries, true).unwrap();
     }
     println!("{:?}", start.elapsed());
 }
