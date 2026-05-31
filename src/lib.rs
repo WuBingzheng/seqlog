@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 
 const LOCK_FILE: &'static str = "LOCK";
 const SUBFIX: &'static str = ".seqlog";
-const BLOCK_SIZE: usize = 64 * 1024;
+
+// encode the length as u16
+const LAST_LEN_MASK: u16 = 0x7FFF;
+const LAST_LEN_FLAG: u16 = 0x8000;
+
+const ENTRY_MAX_LEN: usize = LAST_LEN_MASK as usize; // make sure: this <= LAST_LEN_MASK
+const BLOCK_SIZE: usize = 64 * 1024; // make sure: this >= ENTRY_MAX_LEN + 8 + 2
 
 pub struct Config {
     pub rotation: usize,
@@ -48,9 +54,8 @@ impl SeqLog {
 
             File::create(path.join(LOCK_FILE))?;
 
-            let seq_buf: [u64; 1] = [1];
             let fname = format!("{:08}{}", 1, SUBFIX);
-            fs::write(path.join(fname), from_slice_u64(&seq_buf))?;
+            fs::write(path.join(fname), from_single_u64(&1))?;
         }
 
         let lock = File::open(path.join(LOCK_FILE))?;
@@ -58,7 +63,8 @@ impl SeqLog {
 
         let (current_file_no, current_path) = locate_last_file(path)?;
 
-        let (next_seq, block_left) = read_file_info(path, &current_path)?;
+        let (next_seq, block_left) = read_file_info(&current_path)?;
+        dbg!(next_seq);
 
         let current = File::options().append(true).open(&current_path)?;
 
@@ -79,60 +85,40 @@ impl SeqLog {
     //   +---------+
     //
     // segment format:
-    //   +2-+2-+
-    //   |C |L |
-    //   +2C------------------+
+    //   +--------------------+
     //   | len, ...           |
     //   +---------------------------------+
     //   | entry, ...                      |
     //   +---------------------------------+
     //
-    // - C: count of entries in this segment
-    // - L: sum of lengths
-    //
-    // so the length of this segment is: 4 + 4 + 4*cnt + slen
+    // The @len is 16-bit, and the last one is set the highest bit.
     pub fn append<T>(&mut self, entries: &[T]) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
-        let mut current_count = 0; // of current segment
-        let mut current_total_len = 0; // of current segment
-        let mut start_seqs = Vec::new(); // if new block
-        let mut headers = Vec::new(); // segment header: C + L
-        let mut lengths = Vec::with_capacity(entries.len()); // lengths
+        let mut start_seqs = Vec::new(); // block header: start seq
+        let mut lengths = Vec::with_capacity(entries.len()); // lengths for segments
 
-        let mut io_slices = Vec::with_capacity(entries.len() + 2); // final input vecter
+        let mut io_slices = Vec::with_capacity(entries.len() + 2);
         let mut block_index = Vec::new(); // index of io_slices for block
         let mut segment_index = Vec::new(); // index of io_slices for segment
 
-        const ZEROS_BUF: [u8; 4] = [0; 4];
-        let dummy = IoSlice::new(&ZEROS_BUF);
-
-        // check if the block-left is too small
-        if self.block_left < 2 + 2 {
-            // padding the block
-            io_slices.push(IoSlice::new(&ZEROS_BUF[..self.block_left]));
-
-            // new block
-            start_seqs.push(self.next_seq);
-            block_index.push(io_slices.len());
-            io_slices.push(dummy); // hold the place
-
-            self.block_left = BLOCK_SIZE - 8;
-        }
+        const DUMMY: [u8; 1] = [0];
+        let dummy = IoSlice::new(&DUMMY);
 
         // new segment
         segment_index.push((io_slices.len(), lengths.len(), 0));
-        io_slices.push(dummy); // hold the place
-
-        self.block_left -= 2 + 2; // reserve for segment header: C + L
+        io_slices.push(dummy); // hold the place for lengths
 
         // iterate entries
         for entry in entries.iter() {
             let entry = entry.as_ref();
             let len = entry.len();
 
-            if len > BLOCK_SIZE / 2 {
+            if len == 0 {
+                continue;
+            }
+            if len > ENTRY_MAX_LEN {
                 return Err(Error::new(
                     std::io::ErrorKind::InvalidData,
                     "too long entry",
@@ -140,55 +126,51 @@ impl SeqLog {
             }
 
             if 2 + len > self.block_left {
-                // need a new block
-
-                // prepare the header for current segment
-                headers.push(current_count as u16);
-                headers.push(current_total_len as u16);
-                segment_index.last_mut().unwrap().2 = lengths.len();
-
-                // clear for new segment in new block
-                current_total_len = 0;
-                current_count = 0;
+                // we need a new block
 
                 // padding the block, by the current entry
                 if len >= self.block_left {
                     io_slices.push(IoSlice::new(&entry[..self.block_left]));
                 } else {
                     io_slices.push(IoSlice::new(&entry));
-                    io_slices.push(IoSlice::new(&ZEROS_BUF[..1])); // just 1 byte
+                    io_slices.push(IoSlice::new(&entry[..1])); // just 1 more byte
                 }
+
+                // close current segment
+                *lengths.last_mut().unwrap() |= LAST_LEN_FLAG;
+                segment_index.last_mut().unwrap().2 = lengths.len();
 
                 // new block
                 start_seqs.push(self.next_seq);
                 block_index.push(io_slices.len());
-                io_slices.push(dummy); // hold the place
+                io_slices.push(dummy); // hold the place for block header
 
                 // new segment in new block
                 segment_index.push((io_slices.len(), lengths.len(), 0));
-                io_slices.push(dummy); // hold the place
+                io_slices.push(dummy); // hold the place for lengths
 
-                self.block_left = BLOCK_SIZE - 8 - 2 - 2;
+                self.block_left = BLOCK_SIZE - 8;
             }
 
             // encode the entry
             self.next_seq += 1;
             self.block_left -= 2 + len;
-            current_count += 1;
-            current_total_len += len;
             lengths.push(len as u16);
             io_slices.push(IoSlice::new(entry));
         }
 
-        // fix the io_slices for block header
-        for (blki, si) in block_index.into_iter().enumerate() {
-            io_slices[si] = IoSlice::new(from_slice_u64(&start_seqs[blki..blki + 1]));
+        // close the last segment
+        *lengths.last_mut().unwrap() |= LAST_LEN_FLAG;
+        segment_index.last_mut().unwrap().2 = lengths.len();
+
+        // fix the io_slices for segments header: lengths
+        for (slci, len_start, len_end) in segment_index.into_iter() {
+            io_slices[slci] = IoSlice::new(from_slice_u16(&lengths[len_start..len_end]));
         }
 
-        // fix the io_slices for segment header
-        segment_index.last_mut().unwrap().2 = lengths.len();
-        for (si, len_start, len_end) in segment_index.into_iter() {
-            io_slices[si] = IoSlice::new(from_slice_u16(&lengths[len_start..len_end]));
+        // fix the io_slices for blocks header: start_seg
+        for (slci, seqr) in block_index.into_iter().zip(start_seqs.iter()) {
+            io_slices[slci] = IoSlice::new(from_single_u64(seqr));
         }
 
         // finally, write into file and sync
@@ -227,7 +209,7 @@ fn locate_last_file(dir: &Path) -> Result<(u64, PathBuf)> {
     Ok((max_no, last_path))
 }
 
-fn read_file_info(dir: &Path, fname: &Path) -> Result<(u64, usize)> {
+fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
     let mut file = File::open(fname)?;
 
     let meta = file.metadata()?;
@@ -245,17 +227,26 @@ fn read_file_info(dir: &Path, fname: &Path) -> Result<(u64, usize)> {
 
     // parse block header: seq
     let mut next_seq = u64::from_le_bytes(block[..8].try_into().unwrap());
+    dbg!(next_seq);
 
     // parse segments
     let mut segment = &block[8..];
     while !segment.is_empty() {
-        let count = u16::from_le_bytes(segment[0..2].try_into().unwrap());
-        let total_len = u16::from_le_bytes(segment[2..4].try_into().unwrap());
+        let mut sum_len = 0;
+        loop {
+            let len = u16::from_le_bytes(segment[0..2].try_into().unwrap());
+            segment = &segment[2..];
 
-        next_seq += count as u64;
+            next_seq += 1;
+            if len & LAST_LEN_FLAG == 0 {
+                sum_len += len;
+            } else {
+                sum_len += len & LAST_LEN_MASK;
+                break;
+            }
+        }
 
-        let raw_len = 2 + 2 + count as usize * 2 + total_len as usize;
-        segment = &segment[raw_len..];
+        segment = &segment[sum_len as usize..];
     }
 
     Ok((next_seq, block_left))
@@ -269,11 +260,7 @@ fn from_slice_u16(buf: &[u16]) -> &[u8] {
         )
     }
 }
-fn from_slice_u64(buf: &[u64]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            buf.as_ptr() as *const u8,
-            buf.len() * std::mem::size_of::<u64>(),
-        )
-    }
+
+fn from_single_u64(r: &u64) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(r as *const u64 as *const u8, 8) }
 }
