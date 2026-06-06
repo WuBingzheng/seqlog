@@ -1,7 +1,8 @@
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::usize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 const LOCK_FILE: &'static str = "LOCK";
 const SUBFIX: &'static str = ".seqlog";
@@ -11,12 +12,11 @@ const ENTRY_MAX_LEN: usize = BLOCK_SIZE - 8 - 2;
 
 const FIRST_SEQ: u64 = 1;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct ArchiveFile {
+struct SeqLogFile {
     file_no: u64,
-    // size: usize,
     start_seq: u64,
     path: PathBuf,
+    refers: AtomicUsize,
 }
 
 pub struct SeqLog {
@@ -26,48 +26,17 @@ pub struct SeqLog {
     rotate_size: usize,
     rotate_count: usize,
 
-    lock: File,
-    archives: Vec<ArchiveFile>,
+    _lock: File,
+    files: Arc<RwLock<Vec<SeqLogFile>>>,
     current: File,
-    current_file_no: u64,
     current_file_size: usize,
     block_left: usize,
-    start_seq: u64,
+    // start_seq: u64,
     next_seq: u64,
-    current_path: PathBuf,
+    // current_path: PathBuf,
 }
 
 impl SeqLog {
-    pub fn rotate(&mut self) -> Result<()> {
-        // old
-        self.archives.push(ArchiveFile {
-            file_no: self.current_file_no,
-            start_seq: self.start_seq,
-            path: self.current_path.clone(),
-            // size: self.current_file_size,
-        });
-
-        // new
-        self.current_file_no += 1;
-        let fname = format!("{:08}{}", self.current_file_no, SUBFIX);
-        self.current_path = self.path.join(fname);
-
-        self.current = File::create_new(&self.current_path)?;
-        self.current.write(from_single_u64(&self.next_seq))?;
-
-        self.start_seq = self.next_seq;
-        self.current_file_size = 8;
-        self.block_left = BLOCK_SIZE - 8;
-
-        // expire
-        while self.archives.len() > self.rotate_count {
-            let file = self.archives.remove(0);
-            fs::remove_file(file.path)?;
-        }
-
-        Ok(())
-    }
-
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
@@ -83,36 +52,30 @@ impl SeqLog {
         let lock = File::open(path.join(LOCK_FILE))?;
         lock.try_lock()?;
 
-        let mut archives = load_archive_files(path)?;
+        let files = load_files(path)?;
 
-        let ArchiveFile {
-            file_no: current_file_no,
-            start_seq,
-            path: current_path,
-        } = archives.pop().unwrap();
+        let current_info = files.last().unwrap();
 
-        let (next_seq, current_file_size) = read_file_info(&current_path)?;
+        let (next_seq, current_file_size) = read_file_info(&current_info.path)?;
         let block_left = BLOCK_SIZE - (current_file_size % BLOCK_SIZE);
         dbg!(next_seq);
 
-        let current = File::options().append(true).open(&current_path)?;
+        let current = File::options().append(true).open(&current_info.path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             rotate_size: 1024 * 1024 * 1024, // 1G
             rotate_count: 20,
-            lock,
-            archives,
+            _lock: lock,
+            files: Arc::new(RwLock::new(files)),
             current,
-            current_file_no,
             current_file_size,
             block_left,
-            start_seq,
             next_seq,
-            current_path,
         })
     }
 
+    /// Configrate rotation.
     pub fn set_rotate(&mut self, size: usize, count: usize) {
         self.rotate_size = if size == 0 { usize::MAX } else { size };
         self.rotate_count = if count == 0 { usize::MAX } else { count };
@@ -220,9 +183,78 @@ impl SeqLog {
     pub fn sync(&mut self) -> Result<()> {
         self.current.sync_data()
     }
+
+    // pub fn new_scanner(&self, start_seq: u64) -> Option<SeqLogScanner> {
+    //     if start_seq > self.next_seq {
+    //         return None;
+    //     }
+    //     if start_seq >= self.start_seq {
+    //     } else {
+    //         let file_infos = self.file_infos.read().unwrap();
+    //         for info in file_infos.iter().rev() {
+    //             if info.start_seq <= start_seq {
+    //                 break;
+    //             }
+    //         }
+    //     }
+
+    //     SeqLogScanner {
+    //         file_infos: self.file_infos.clone(),
+    //     }
+    // }
+
+    pub fn rotate(&mut self) -> Result<()> {
+        // open new file
+        let last_file_no = self.files.read().unwrap().last().unwrap().file_no;
+        let new_file_no = last_file_no + 1;
+        let fname = format!("{:08}{}", new_file_no, SUBFIX);
+        let path = self.path.join(fname);
+
+        self.current = File::create_new(&path)?;
+        self.current.write(from_single_u64(&self.next_seq))?;
+
+        self.current_file_size = 8;
+        self.block_left = BLOCK_SIZE - 8;
+
+        // save new file info
+        let new_file = SeqLogFile {
+            file_no: new_file_no,
+            start_seq: self.next_seq,
+            path,
+            refers: AtomicUsize::new(0),
+        };
+
+        let mut files = self.files.write().unwrap();
+        files.push(new_file);
+
+        // expire
+        while files.len() > self.rotate_count {
+            if files[0].refers.load(Ordering::Relaxed) > 0 {
+                // this file is in used
+                break;
+            }
+            let file = files.remove(0);
+            fs::remove_file(file.path)?;
+        }
+        Ok(())
+    }
 }
 
-fn load_archive_files(dir: &Path) -> Result<Vec<ArchiveFile>> {
+// pub struct SeqLogScanner {
+//     files: Arc<RwLock<Vec<SeqLogFile>>>,
+
+//     last_file_index: usize,
+//     last_seq: usize,
+//     last_block: Vec<u8>,
+// }
+
+// impl SeqLogScanner {
+//     pub fn next(&mut self) -> Result<Option<&[u8]>> {
+//         todo!()
+//     }
+// }
+
+fn load_files(dir: &Path) -> Result<Vec<SeqLogFile>> {
     let mut files = Vec::new();
     let mut seq_buf: [u8; 8] = [0; _];
 
@@ -244,15 +276,16 @@ fn load_archive_files(dir: &Path) -> Result<Vec<ArchiveFile>> {
         file.read_exact(&mut seq_buf)?;
         let start_seq = u64::from_le_bytes(seq_buf);
 
-        files.push(ArchiveFile {
+        files.push(SeqLogFile {
             path,
             start_seq,
             file_no,
+            refers: AtomicUsize::new(0),
         });
     }
 
     // sort by file_no
-    files.sort();
+    files.sort_by_key(|af| af.file_no);
 
     // check the file_no is consecutive
     if !files.windows(2).all(|a| a[0].file_no + 1 == a[1].file_no) {
