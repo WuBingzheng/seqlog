@@ -4,11 +4,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
 const LOCK_FILE: &'static str = "LOCK";
 const SUBFIX: &'static str = ".seqlog";
 
+const SEQ_SIZE: usize = std::mem::size_of::<u64>();
+const LEN_SIZE: usize = std::mem::size_of::<u16>();
+
 const BLOCK_SIZE: usize = 64 * 1024;
-const ENTRY_MAX_LEN: usize = BLOCK_SIZE - 8 - 2;
+const ENTRY_MAX_LEN: usize = BLOCK_SIZE - SEQ_SIZE - LEN_SIZE;
 
 const FIRST_SEQ: u64 = 1;
 
@@ -31,9 +39,7 @@ pub struct SeqLog {
     current: File,
     current_file_size: usize,
     block_left: usize,
-    // start_seq: u64,
     next_seq: u64,
-    // current_path: PathBuf,
 }
 
 impl SeqLog {
@@ -100,7 +106,7 @@ impl SeqLog {
 
         let origin_block_left = self.block_left;
 
-        const ZEROS: [u8; 2] = [0; 2];
+        const ZEROS: [u8; LEN_SIZE] = [0; _];
         let dummy = IoSlice::new(&ZEROS);
 
         for entry in entries.iter() {
@@ -114,24 +120,24 @@ impl SeqLog {
                 return Err(Error::new(ErrorKind::InvalidData, "too long entry"));
             }
 
-            if 2 + len > self.block_left {
+            if LEN_SIZE + len > self.block_left {
                 // we need a new block
 
                 // padding the block
-                if self.block_left <= 2 {
+                if self.block_left <= LEN_SIZE {
                     bufs.push(IoSlice::new(&ZEROS[..self.block_left]));
                 } else {
                     // push 2 zeros to indicate the end of block
-                    bufs.push(IoSlice::new(&ZEROS[..2]));
+                    bufs.push(IoSlice::new(&ZEROS[..LEN_SIZE]));
                     // pad the remaining by this entry which is long enough
-                    bufs.push(IoSlice::new(&entry[..self.block_left - 2]));
+                    bufs.push(IoSlice::new(&entry[..self.block_left - LEN_SIZE]));
                 }
 
                 // new block
                 blocks.push((bufs.len(), self.next_seq));
                 bufs.push(dummy); // hold the place for block header
 
-                self.block_left = BLOCK_SIZE - 8;
+                self.block_left = BLOCK_SIZE - SEQ_SIZE;
             }
 
             // encode the length
@@ -142,7 +148,7 @@ impl SeqLog {
             bufs.push(IoSlice::new(entry));
 
             self.next_seq += 1;
-            self.block_left -= 2 + len;
+            self.block_left -= LEN_SIZE + len;
         }
 
         // fix the bufs for segments header: lengths
@@ -213,8 +219,8 @@ impl SeqLog {
         self.current = File::create_new(&path)?;
         self.current.write(from_single_u64(&self.next_seq))?;
 
-        self.current_file_size = 8;
-        self.block_left = BLOCK_SIZE - 8;
+        self.current_file_size = SEQ_SIZE;
+        self.block_left = BLOCK_SIZE - SEQ_SIZE;
 
         // save new file info
         let new_file = SeqLogFile {
@@ -240,23 +246,136 @@ impl SeqLog {
     }
 }
 
-// pub struct SeqLogScanner {
-//     files: Arc<RwLock<Vec<SeqLogFile>>>,
+fn read_block_seq(file: &mut File, block: usize) -> Result<u64> {
+    let mut buf: [u8; SEQ_SIZE] = [0; _];
+    file.read_exact_at(&mut buf, (block * BLOCK_SIZE) as u64)?;
+    Ok(u64::from_le_bytes(buf))
+}
 
-//     last_file_index: usize,
-//     last_seq: usize,
-//     last_block: Vec<u8>,
-// }
+pub struct SeqLogScanner {
+    files: Arc<RwLock<Vec<SeqLogFile>>>,
 
-// impl SeqLogScanner {
-//     pub fn next(&mut self) -> Result<Option<&[u8]>> {
-//         todo!()
-//     }
-// }
+    next_seq: u64,
+    current: File,
+    file_no: u64,
+    block_buf: Vec<u8>,
+    block_pos: usize,
+}
+
+impl SeqLogScanner {
+    pub fn reset_seq(&mut self, seq: u64) -> Result<()> {
+        // if seq > self.main.next_seq {
+        //     return Ok(false);
+        // }
+
+        // locate the file
+        let files = self.files.read().unwrap();
+        let Some(seqlog_file) = files.iter().rev().find(|&f| f.start_seq <= seq) else {
+            return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+        };
+        seqlog_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
+
+        // copy info to unlock ASAP
+        let start_seq = seqlog_file.start_seq;
+        let path = seqlog_file.path.clone();
+        let file_no = seqlog_file.file_no;
+        drop(files);
+
+        let mut file = File::open(&path)?;
+
+        // locate block in file
+        let (block_index, block_seq) = locate_block(&mut file, start_seq, seq)?;
+
+        // locate entry in block
+        self.block_pos = locate_entry(&mut file, &mut self.block_buf, block_index, block_seq, seq)?;
+
+        // done
+        self.current = file;
+        self.file_no = file_no;
+        self.next_seq = seq;
+        Ok(())
+    }
+
+    pub fn next(&mut self) -> Result<Option<&[u8]>> {
+        todo!()
+    }
+}
+
+fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64)> {
+    assert!(start_seq <= seq);
+
+    let file_len = file.metadata()?.len() as usize;
+    let block_count = (file_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    let last_block_seq = read_block_seq(file, block_count - 1)?;
+
+    // guess a block index
+    let seqs_per_block = (last_block_seq - start_seq) as usize / (block_count - 1);
+    let guess_block_index = (seq - start_seq) as usize / seqs_per_block;
+
+    // search the block around the guessed-block
+    let guess_block_seq = read_block_seq(file, guess_block_index)?;
+    if guess_block_seq > seq {
+        // search backward
+        for i in (0..guess_block_index).rev() {
+            let blk_seq = read_block_seq(file, i)?;
+            if blk_seq <= seq {
+                return Ok((i, blk_seq));
+            }
+        }
+    } else if guess_block_seq < seq {
+        // search forward
+        let mut last_block_seq = guess_block_seq;
+        for i in guess_block_index + 1..block_count {
+            let blk_seq = read_block_seq(file, i)?;
+            if blk_seq > seq {
+                return Ok((i - 1, last_block_seq));
+            }
+            last_block_seq = blk_seq;
+        }
+    } else {
+        return Ok((guess_block_index, guess_block_seq));
+    }
+
+    unreachable!("no block found");
+}
+
+fn locate_entry(
+    file: &mut File,
+    block_buf: &mut Vec<u8>,
+    block_index: usize,
+    mut next_seq: u64,
+    seq: u64,
+) -> Result<usize> {
+    block_buf.resize(BLOCK_SIZE, 0); // TODO optimize
+
+    // read block from file
+    file.seek(SeekFrom::Start((block_index * BLOCK_SIZE) as u64))?;
+    let block_len = file.read(block_buf)?;
+    block_buf.truncate(block_len);
+
+    // parse entries
+    let mut pos = SEQ_SIZE;
+    while pos < block_len - LEN_SIZE {
+        let len = u16::from_le_bytes(block_buf[pos..pos + LEN_SIZE].try_into().unwrap());
+        if len == 0 {
+            break;
+        }
+
+        next_seq += 1;
+        if next_seq == seq {
+            return Ok(pos);
+        }
+
+        pos += LEN_SIZE + len as usize;
+    }
+
+    return Err(Error::new(ErrorKind::NotFound, "seq is unreal"));
+}
 
 fn load_files(dir: &Path) -> Result<Vec<SeqLogFile>> {
     let mut files = Vec::new();
-    let mut seq_buf: [u8; 8] = [0; _];
+    let mut seq_buf: [u8; SEQ_SIZE] = [0; _];
 
     for entry in fs::read_dir(dir)? {
         let path = entry?.path().to_path_buf();
@@ -317,22 +436,22 @@ fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
     file.seek(SeekFrom::Start((len / BLOCK_SIZE * BLOCK_SIZE) as u64))?;
     file.read_to_end(&mut block)?;
 
-    if block.len() < 8 {
+    if block.len() < SEQ_SIZE {
         panic!("invalid block header {}", block.len());
     }
 
     // parse block header: start seq
-    let mut next_seq = u64::from_le_bytes(block[..8].try_into().unwrap());
+    let mut next_seq = u64::from_le_bytes(block[..SEQ_SIZE].try_into().unwrap());
     dbg!(next_seq);
 
     // parse entries
-    let mut entry = &block[8..];
-    while entry.len() > 2 {
-        let len = u16::from_le_bytes(entry[0..2].try_into().unwrap());
+    let mut entry = &block[SEQ_SIZE..];
+    while entry.len() > LEN_SIZE {
+        let len = u16::from_le_bytes(entry[0..LEN_SIZE].try_into().unwrap());
         if len == 0 {
             break;
         }
-        entry = &entry[2 + len as usize..];
+        entry = &entry[LEN_SIZE + len as usize..];
 
         next_seq += 1;
     }
