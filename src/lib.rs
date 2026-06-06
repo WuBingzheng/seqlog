@@ -1,82 +1,121 @@
 use std::fs::{self, File};
-use std::io::{Error, IoSlice, Read, Result, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::usize;
 
 const LOCK_FILE: &'static str = "LOCK";
 const SUBFIX: &'static str = ".seqlog";
 
-// encode the length as u16
-const LAST_LEN_MASK: u16 = 0x7FFF;
-const LAST_LEN_FLAG: u16 = 0x8000;
+const BLOCK_SIZE: usize = 64 * 1024;
+const ENTRY_MAX_LEN: usize = BLOCK_SIZE - 8 - 2;
 
-const ENTRY_MAX_LEN: usize = LAST_LEN_MASK as usize; // make sure: this <= LAST_LEN_MASK
-const BLOCK_SIZE: usize = 64 * 1024; // make sure: this >= ENTRY_MAX_LEN + 8 + 2
+const FIRST_SEQ: u64 = 1;
 
-pub struct Config {
-    pub rotation: usize,
-    pub retention: usize,
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ArchiveFile {
+    file_no: u64,
+    // size: usize,
+    start_seq: u64,
+    path: PathBuf,
 }
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            rotation: 1024 * 1024 * 1024, // 1GB
-            retention: 10,
-        }
-    }
-}
-
-impl Config {}
 
 pub struct SeqLog {
     path: PathBuf,
-    config: Config,
+
+    // config
+    rotate_size: usize,
+    rotate_count: usize,
+
     lock: File,
+    archives: Vec<ArchiveFile>,
     current: File,
     current_file_no: u64,
+    current_file_size: usize,
     block_left: usize,
+    start_seq: u64,
     next_seq: u64,
+    current_path: PathBuf,
 }
 
 impl SeqLog {
     pub fn rotate(&mut self) -> Result<()> {
+        // old
+        self.archives.push(ArchiveFile {
+            file_no: self.current_file_no,
+            start_seq: self.start_seq,
+            path: self.current_path.clone(),
+            // size: self.current_file_size,
+        });
+
+        // new
         self.current_file_no += 1;
         let fname = format!("{:08}{}", self.current_file_no, SUBFIX);
-        self.current = File::create_new(self.path.join(fname))?;
+        self.current_path = self.path.join(fname);
+
+        self.current = File::create_new(&self.current_path)?;
+        self.current.write(from_single_u64(&self.next_seq))?;
+
+        self.start_seq = self.next_seq;
+        self.current_file_size = 8;
+        self.block_left = BLOCK_SIZE - 8;
+
+        // expire
+        while self.archives.len() > self.rotate_count {
+            let file = self.archives.remove(0);
+            fs::remove_file(file.path)?;
+        }
+
         Ok(())
     }
 
-    pub fn open<P: AsRef<Path>>(path: P, config: Config) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
-            std::fs::create_dir_all(path)?;
+            fs::create_dir_all(path)?;
 
             File::create(path.join(LOCK_FILE))?;
 
             let fname = format!("{:08}{}", 1, SUBFIX);
-            fs::write(path.join(fname), from_single_u64(&1))?;
+            fs::write(path.join(fname), from_single_u64(&FIRST_SEQ))?;
         }
 
         let lock = File::open(path.join(LOCK_FILE))?;
         lock.try_lock()?;
 
-        let (current_file_no, current_path) = locate_last_file(path)?;
+        let mut archives = load_archive_files(path)?;
 
-        let (next_seq, block_left) = read_file_info(&current_path)?;
+        let ArchiveFile {
+            file_no: current_file_no,
+            start_seq,
+            path: current_path,
+        } = archives.pop().unwrap();
+
+        let (next_seq, current_file_size) = read_file_info(&current_path)?;
+        let block_left = BLOCK_SIZE - (current_file_size % BLOCK_SIZE);
         dbg!(next_seq);
 
         let current = File::options().append(true).open(&current_path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
-            config,
+            rotate_size: 1024 * 1024 * 1024, // 1G
+            rotate_count: 20,
             lock,
+            archives,
             current,
             current_file_no,
+            current_file_size,
             block_left,
+            start_seq,
             next_seq,
+            current_path,
         })
+    }
+
+    pub fn set_rotate(&mut self, size: usize, count: usize) {
+        self.rotate_size = if size == 0 { usize::MAX } else { size };
+        self.rotate_count = if count == 0 { usize::MAX } else { count };
     }
 
     // block header:
@@ -84,33 +123,23 @@ impl SeqLog {
     //   | seq     |
     //   +---------+
     //
-    // segment format:
-    //   +--------------------+
-    //   | len, ...           |
-    //   +---------------------------------+
-    //   | entry, ...                      |
-    //   +---------------------------------+
-    //
-    // The @len is 16-bit, and the last one is set the highest bit.
-    pub fn append<T>(&mut self, entries: &[T], sync: bool) -> Result<()>
+    // entry format:
+    //   +2--+----------------+
+    //   |len|entry           |
+    //   +---+----------------+
+    pub fn append<T>(&mut self, entries: &[T]) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
-        let mut start_seqs = Vec::new(); // block header: start seq
-        let mut lengths = Vec::with_capacity(entries.len()); // lengths for segments
+        let mut blocks = Vec::new(); // block header: start seq
+        let mut lengths = Vec::with_capacity(entries.len()); // lengths for every entries
+        let mut bufs = Vec::with_capacity(entries.len() + 2);
 
-        let mut io_slices = Vec::with_capacity(entries.len() + 2);
-        let mut block_index = Vec::new(); // index of io_slices for block
-        let mut segment_index = Vec::new(); // index of io_slices for segment
+        let origin_block_left = self.block_left;
 
-        const DUMMY: [u8; 1] = [0];
-        let dummy = IoSlice::new(&DUMMY);
+        const ZEROS: [u8; 2] = [0; 2];
+        let dummy = IoSlice::new(&ZEROS);
 
-        // new segment
-        segment_index.push((io_slices.len(), lengths.len(), lengths.len()));
-        io_slices.push(dummy); // hold the place for lengths
-
-        // iterate entries
         for entry in entries.iter() {
             let entry = entry.as_ref();
             let len = entry.len();
@@ -119,100 +148,129 @@ impl SeqLog {
                 continue;
             }
             if len > ENTRY_MAX_LEN {
-                return Err(Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "too long entry",
-                ));
+                return Err(Error::new(ErrorKind::InvalidData, "too long entry"));
             }
 
             if 2 + len > self.block_left {
                 // we need a new block
 
-                // padding the block, by the current entry
-                if len >= self.block_left {
-                    io_slices.push(IoSlice::new(&entry[..self.block_left]));
+                // padding the block
+                if self.block_left <= 2 {
+                    bufs.push(IoSlice::new(&ZEROS[..self.block_left]));
                 } else {
-                    io_slices.push(IoSlice::new(&entry));
-                    io_slices.push(IoSlice::new(&entry[..1])); // just 1 more byte
-                }
-
-                // close current segment
-                if let Some(last_len) = lengths.last_mut() {
-                    *last_len |= LAST_LEN_FLAG;
-                    segment_index.last_mut().unwrap().2 = lengths.len();
+                    // push 2 zeros to indicate the end of block
+                    bufs.push(IoSlice::new(&ZEROS[..2]));
+                    // pad the remaining by this entry which is long enough
+                    bufs.push(IoSlice::new(&entry[..self.block_left - 2]));
                 }
 
                 // new block
-                start_seqs.push(self.next_seq);
-                block_index.push(io_slices.len());
-                io_slices.push(dummy); // hold the place for block header
-
-                // new segment in new block
-                segment_index.push((io_slices.len(), lengths.len(), 0));
-                io_slices.push(dummy); // hold the place for lengths
+                blocks.push((bufs.len(), self.next_seq));
+                bufs.push(dummy); // hold the place for block header
 
                 self.block_left = BLOCK_SIZE - 8;
             }
 
+            // encode the length
+            lengths.push((bufs.len(), len as u16));
+            bufs.push(dummy); // hold the place for length
+
             // encode the entry
+            bufs.push(IoSlice::new(entry));
+
             self.next_seq += 1;
             self.block_left -= 2 + len;
-            lengths.push(len as u16);
-            io_slices.push(IoSlice::new(entry));
         }
 
-        // close the last segment
-        if let Some(last_len) = lengths.last_mut() {
-            *last_len |= LAST_LEN_FLAG;
-            segment_index.last_mut().unwrap().2 = lengths.len();
+        // fix the bufs for segments header: lengths
+        for (i, len) in lengths.iter() {
+            bufs[*i] = IoSlice::new(from_single_u16(len));
         }
 
-        // fix the io_slices for segments header: lengths
-        for (slci, len_start, len_end) in segment_index.into_iter() {
-            io_slices[slci] = IoSlice::new(from_slice_u16(&lengths[len_start..len_end]));
+        // fix the bufs for blocks header: start_seg
+        for (i, seq) in blocks.iter() {
+            bufs[*i] = IoSlice::new(from_single_u64(seq));
         }
 
-        // fix the io_slices for blocks header: start_seg
-        for (slci, seqr) in block_index.into_iter().zip(start_seqs.iter()) {
-            io_slices[slci] = IoSlice::new(from_single_u64(seqr));
+        // finally, write into file
+        let mut total_len = blocks.len() * BLOCK_SIZE + origin_block_left - self.block_left;
+        self.current_file_size += total_len;
+        loop {
+            match self.current.write_vectored(&bufs) {
+                Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "write zero")),
+                Ok(n) if n == total_len => break, // success!
+                Ok(n) => {
+                    // partial, try again
+                    IoSlice::advance_slices(&mut bufs.as_mut_slice(), n);
+                    total_len -= n;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
 
-        // finally, write into file and sync
-        self.current.write_vectored(&io_slices)?;
-        if sync {
-            self.current.sync_data()?;
+        // check rotation
+        if self.current_file_size >= self.rotate_size {
+            self.rotate()?;
         }
+
         Ok(())
     }
 
-    pub fn scan(&mut self, _start: u64, _end: u64) -> Result<()> {
-        Ok(())
+    pub fn sync(&mut self) -> Result<()> {
+        self.current.sync_data()
     }
 }
 
-fn locate_last_file(dir: &Path) -> Result<(u64, PathBuf)> {
-    let mut max_no = 0;
-    let mut last_path = PathBuf::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+fn load_archive_files(dir: &Path) -> Result<Vec<ArchiveFile>> {
+    let mut files = Vec::new();
+    let mut seq_buf: [u8; 8] = [0; _];
+
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path().to_path_buf();
         let fname = path
             .file_name()
             .expect("invalid filename")
             .to_str()
             .expect("fail to parse filename");
-        if fname == LOCK_FILE {
+        if !fname.ends_with(SUBFIX) {
             continue;
         }
-        if !fname.ends_with(SUBFIX) {
-            continue; // TODO
-        }
-        let seq: u64 = fname[..fname.len() - SUBFIX.len()].parse().unwrap();
-        if seq >= max_no {
-            max_no = seq;
-            last_path = path;
-        }
+        let Ok(file_no) = fname[..fname.len() - SUBFIX.len()].parse() else {
+            continue;
+        };
+
+        let mut file = File::open(&path)?;
+        file.read_exact(&mut seq_buf)?;
+        let start_seq = u64::from_le_bytes(seq_buf);
+
+        files.push(ArchiveFile {
+            path,
+            start_seq,
+            file_no,
+        });
     }
-    Ok((max_no, last_path))
+
+    // sort by file_no
+    files.sort();
+
+    // check the file_no is consecutive
+    if !files.windows(2).all(|a| a[0].file_no + 1 == a[1].file_no) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "file NO is not consecutive",
+        ));
+    }
+
+    // check the start_seq is increasing
+    if !files.windows(2).all(|a| a[0].start_seq < a[1].start_seq) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "start_seq is not increasing",
+        ));
+    }
+
+    Ok(files)
 }
 
 fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
@@ -220,7 +278,6 @@ fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
 
     let meta = file.metadata()?;
     let len = meta.len() as usize;
-    let block_left = BLOCK_SIZE - (len % BLOCK_SIZE);
 
     // read block into memory
     let mut block = Vec::new();
@@ -231,40 +288,27 @@ fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
         panic!("invalid block header {}", block.len());
     }
 
-    // parse block header: seq
+    // parse block header: start seq
     let mut next_seq = u64::from_le_bytes(block[..8].try_into().unwrap());
     dbg!(next_seq);
 
-    // parse segments
-    let mut segment = &block[8..];
-    while !segment.is_empty() {
-        let mut sum_len = 0;
-        loop {
-            let len = u16::from_le_bytes(segment[0..2].try_into().unwrap());
-            segment = &segment[2..];
-
-            next_seq += 1;
-            if len & LAST_LEN_FLAG == 0 {
-                sum_len += len;
-            } else {
-                sum_len += len & LAST_LEN_MASK;
-                break;
-            }
+    // parse entries
+    let mut entry = &block[8..];
+    while entry.len() > 2 {
+        let len = u16::from_le_bytes(entry[0..2].try_into().unwrap());
+        if len == 0 {
+            break;
         }
+        entry = &entry[2 + len as usize..];
 
-        segment = &segment[sum_len as usize..];
+        next_seq += 1;
     }
 
-    Ok((next_seq, block_left))
+    Ok((next_seq, len))
 }
 
-fn from_slice_u16(buf: &[u16]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            buf.as_ptr() as *const u8,
-            buf.len() * std::mem::size_of::<u16>(),
-        )
-    }
+fn from_single_u16(r: &u16) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(r as *const u16 as *const u8, 2) }
 }
 
 fn from_single_u64(r: &u64) -> &[u8] {

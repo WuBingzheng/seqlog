@@ -1,9 +1,9 @@
-use seqlog::{Config, SeqLog};
+use seqlog::SeqLog;
 
 use std::time::Instant;
 
 fn main() {
-    let mut seqlog = SeqLog::open("target/example/run/", Config::default()).unwrap();
+    let mut seqlog = SeqLog::open("target/example/run/").unwrap();
 
     let entries = vec![
         "111",
@@ -25,7 +25,8 @@ fn main() {
 
     let start = Instant::now();
     for _ in 0..2 {
-        seqlog.append(&entries, true).unwrap();
+        seqlog.append(&entries).unwrap();
     }
+    seqlog.sync().unwrap();
     println!("{:?}", start.elapsed());
 }
