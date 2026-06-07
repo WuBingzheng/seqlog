@@ -190,24 +190,22 @@ impl SeqLog {
         self.current.sync_data()
     }
 
-    // pub fn new_scanner(&self, start_seq: u64) -> Option<SeqLogScanner> {
-    //     if start_seq > self.next_seq {
-    //         return None;
-    //     }
-    //     if start_seq >= self.start_seq {
-    //     } else {
-    //         let file_infos = self.file_infos.read().unwrap();
-    //         for info in file_infos.iter().rev() {
-    //             if info.start_seq <= start_seq {
-    //                 break;
-    //             }
-    //         }
-    //     }
+    pub fn new_scanner(&self, start_seq: u64) -> Result<SeqLogScanner> {
+        let mut block_buf = Vec::new();
+        let (file, file_no, block_pos) = seek_seq(&self.files, start_seq, &mut block_buf)?;
 
-    //     SeqLogScanner {
-    //         file_infos: self.file_infos.clone(),
-    //     }
-    // }
+        Ok(SeqLogScanner {
+            files: self.files.clone(),
+
+            current: file,
+            file_no,
+            block_buf,
+            block_pos,
+
+            start_seq,
+            next_seq: start_seq,
+        })
+    }
 
     pub fn rotate(&mut self) -> Result<()> {
         // open new file
@@ -267,36 +265,18 @@ pub struct SeqLogScanner {
 
 impl SeqLogScanner {
     pub fn reset_seq(&mut self, seq: u64) -> Result<()> {
-        // if seq > self.main.next_seq {
-        //     return Ok(false);
-        // }
+        let (file, file_no, block_pos) = seek_seq(&self.files, seq, &mut self.block_buf)?;
 
-        // locate the file
+        // unlock original file
         let files = self.files.read().unwrap();
-        let Some(seqlog_file) = files.iter().rev().find(|&f| f.start_seq <= seq) else {
-            return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
-        };
-        seqlog_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
+        let seqlog_file = files
+            .iter()
+            .rev()
+            .find(|&f| f.file_no == self.file_no)
+            .unwrap();
+        seqlog_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
 
-        // copy info to unlock ASAP
-        let start_seq = seqlog_file.start_seq;
-        let path = seqlog_file.path.clone();
-        let file_no = seqlog_file.file_no;
-        drop(files);
-
-        // seek the seq
-        let (file, block_pos) = match seek_by_seq(&path, &mut self.block_buf, start_seq, seq) {
-            Ok((file, block_pos)) => (file, block_pos),
-            Err(err) => {
-                // roll back the lock
-                let files = self.files.read().unwrap();
-                let seqlog_file = files.iter().rev().find(|&f| f.start_seq <= seq).unwrap();
-                seqlog_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
-                return Err(err);
-            }
-        };
-
-        // done
+        // update
         self.block_pos = block_pos;
         self.current = file;
         self.file_no = file_no;
@@ -306,16 +286,61 @@ impl SeqLogScanner {
         Ok(())
     }
 
-    pub fn next(&mut self) -> Result<Option<&[u8]>> {
+    pub fn next(&mut self) -> Result<&[u8]> {
+        let buf = &self.block_buf[self.block_pos..];
+        if buf.len() > LEN_SIZE {
+            let len = u16::from_le_bytes(buf[..LEN_SIZE].try_into().unwrap());
+            if len != 0 {
+                self.block_pos += LEN_SIZE + len as usize;
+                return Ok(&buf[LEN_SIZE..LEN_SIZE + len as usize]);
+            }
+        }
         todo!()
     }
 }
 
-fn seek_by_seq(
-    path: &Path,
+fn seek_seq(
+    seqlog_files: &Arc<RwLock<Vec<SeqLogFile>>>,
+    seq: u64,
     block_buf: &mut Vec<u8>,
+) -> Result<(File, u64, usize)> {
+    // if seq > self.main.next_seq {
+    //     return Ok(false);
+    // }
+
+    // locate the file
+    let files = seqlog_files.read().unwrap();
+    let Some(seqlog_file) = files.iter().rev().find(|&f| f.start_seq <= seq) else {
+        return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+    };
+    seqlog_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
+
+    // copy info to unlock the seqlog_files ASAP
+    let start_seq = seqlog_file.start_seq;
+    let path = seqlog_file.path.clone();
+    let file_no = seqlog_file.file_no;
+    drop(files);
+
+    // seek the seq in the file
+    let (file, block_pos) = match seek_seq_in_file(&path, start_seq, seq, block_buf) {
+        Ok((file, block_pos)) => (file, block_pos),
+        Err(err) => {
+            // roll back the lock
+            let files = seqlog_files.read().unwrap();
+            let seqlog_file = files.iter().rev().find(|&f| f.start_seq <= seq).unwrap();
+            seqlog_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
+            return Err(err);
+        }
+    };
+
+    Ok((file, file_no, block_pos))
+}
+
+fn seek_seq_in_file(
+    path: &Path,
     start_seq: u64,
     seq: u64,
+    block_buf: &mut Vec<u8>,
 ) -> Result<(File, usize)> {
     let mut file = File::open(&path)?;
 
