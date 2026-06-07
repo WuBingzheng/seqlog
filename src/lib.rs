@@ -287,15 +287,62 @@ impl SeqLogScanner {
     }
 
     pub fn next(&mut self) -> Result<&[u8]> {
-        let buf = &self.block_buf[self.block_pos..];
-        if buf.len() > LEN_SIZE {
-            let len = u16::from_le_bytes(buf[..LEN_SIZE].try_into().unwrap());
+        // check any entry in current block
+        if self.block_buf.len() > self.block_pos + LEN_SIZE {
+            let len = parse_len(&self.block_buf[self.block_pos..]);
             if len != 0 {
-                self.block_pos += LEN_SIZE + len as usize;
-                return Ok(&buf[LEN_SIZE..LEN_SIZE + len as usize]);
+                // yes, happy path
+                self.next_seq += 1;
+                self.block_pos += LEN_SIZE + len;
+                return Ok(&self.block_buf[self.block_pos - len..self.block_pos]);
             }
         }
-        todo!()
+
+        // read more data
+        let mut block_len = if self.block_buf.len() == BLOCK_SIZE {
+            // the current block is full-size, so read the next block
+            self.current.read(&mut self.block_buf)?
+        } else {
+            // non-full-size block, read remaining part in this block
+            self.block_buf.resize(BLOCK_SIZE, 0);
+            self.current.read(&mut self.block_buf[self.block_pos..])?
+        };
+
+        // if did not read more data
+        if block_len == 0 {
+            let files = self.files.read().unwrap();
+
+            // check if the current file is the last one
+            if files.last().unwrap().file_no == self.file_no {
+                // yes, return EOF
+                return Ok(&[]);
+            }
+
+            // open next file
+            self.file_no += 1;
+            let seqlog_file = files
+                .iter()
+                .rev()
+                .find(|f| f.file_no == self.file_no)
+                .unwrap();
+
+            self.current = File::open(&seqlog_file.path)?;
+            block_len = self.current.read(&mut self.block_buf)?;
+        }
+
+        self.block_buf.truncate(block_len);
+        self.block_pos = SEQ_SIZE;
+
+        if self.block_buf.len() > self.block_pos + LEN_SIZE {
+            let len = parse_len(&self.block_buf[self.block_pos..]);
+            if len != 0 {
+                self.next_seq += 1;
+                self.block_pos += LEN_SIZE + len;
+                return Ok(&self.block_buf[self.block_pos - len..self.block_pos]);
+            }
+        }
+
+        Ok(&[]) // EOF
     }
 }
 
@@ -409,7 +456,7 @@ fn locate_entry(
     // parse entries
     let mut pos = SEQ_SIZE;
     while pos < block_len - LEN_SIZE {
-        let len = u16::from_le_bytes(block_buf[pos..pos + LEN_SIZE].try_into().unwrap());
+        let len = parse_len(&block_buf[pos..]);
         if len == 0 {
             break;
         }
@@ -419,7 +466,7 @@ fn locate_entry(
             return Ok(pos);
         }
 
-        pos += LEN_SIZE + len as usize;
+        pos += LEN_SIZE + len;
     }
 
     return Err(Error::new(ErrorKind::NotFound, "seq is unreal"));
@@ -493,22 +540,30 @@ fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
     }
 
     // parse block header: start seq
-    let mut next_seq = u64::from_le_bytes(block[..SEQ_SIZE].try_into().unwrap());
+    let mut next_seq = parse_seq(&block);
     dbg!(next_seq);
 
     // parse entries
     let mut entry = &block[SEQ_SIZE..];
     while entry.len() > LEN_SIZE {
-        let len = u16::from_le_bytes(entry[0..LEN_SIZE].try_into().unwrap());
+        let len = parse_len(entry);
         if len == 0 {
             break;
         }
-        entry = &entry[LEN_SIZE + len as usize..];
+        entry = &entry[LEN_SIZE + len..];
 
         next_seq += 1;
     }
 
     Ok((next_seq, len))
+}
+
+fn parse_len(buf: &[u8]) -> usize {
+    u16::from_le_bytes(buf[0..LEN_SIZE].try_into().unwrap()) as usize
+}
+
+fn parse_seq(buf: &[u8]) -> u64 {
+    u64::from_le_bytes(buf[0..SEQ_SIZE].try_into().unwrap())
 }
 
 fn from_single_u16(r: &u16) -> &[u8] {
