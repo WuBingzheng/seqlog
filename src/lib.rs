@@ -255,11 +255,14 @@ fn read_block_seq(file: &mut File, block: usize) -> Result<u64> {
 pub struct SeqLogScanner {
     files: Arc<RwLock<Vec<SeqLogFile>>>,
 
-    next_seq: u64,
     current: File,
     file_no: u64,
     block_buf: Vec<u8>,
     block_pos: usize,
+
+    // stats only
+    start_seq: u64,
+    next_seq: u64,
 }
 
 impl SeqLogScanner {
@@ -281,17 +284,24 @@ impl SeqLogScanner {
         let file_no = seqlog_file.file_no;
         drop(files);
 
-        let mut file = File::open(&path)?;
-
-        // locate block in file
-        let (block_index, block_seq) = locate_block(&mut file, start_seq, seq)?;
-
-        // locate entry in block
-        self.block_pos = locate_entry(&mut file, &mut self.block_buf, block_index, block_seq, seq)?;
+        // seek the seq
+        let (file, block_pos) = match seek_by_seq(&path, &mut self.block_buf, start_seq, seq) {
+            Ok((file, block_pos)) => (file, block_pos),
+            Err(err) => {
+                // roll back the lock
+                let files = self.files.read().unwrap();
+                let seqlog_file = files.iter().rev().find(|&f| f.start_seq <= seq).unwrap();
+                seqlog_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
+                return Err(err);
+            }
+        };
 
         // done
+        self.block_pos = block_pos;
         self.current = file;
         self.file_no = file_no;
+
+        self.start_seq = seq;
         self.next_seq = seq;
         Ok(())
     }
@@ -299,6 +309,23 @@ impl SeqLogScanner {
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
         todo!()
     }
+}
+
+fn seek_by_seq(
+    path: &Path,
+    block_buf: &mut Vec<u8>,
+    start_seq: u64,
+    seq: u64,
+) -> Result<(File, usize)> {
+    let mut file = File::open(&path)?;
+
+    // locate block in file
+    let (block_index, block_seq) = locate_block(&mut file, start_seq, seq)?;
+
+    // locate entry in block
+    let block_pos = locate_entry(&mut file, block_buf, block_index, block_seq, seq)?;
+
+    Ok((file, block_pos))
 }
 
 fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64)> {
