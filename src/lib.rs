@@ -21,44 +21,47 @@ const BLOCK_SIZE: usize = 64 * 1024;
 const ENTRY_MAX_LEN: usize = BLOCK_SIZE - SEQ_SIZE - LEN_SIZE;
 
 struct DataFile {
-    // the file name, also the first entry seq
+    // the file name, also the first entry seq in this file
     seq: u64,
 
     // by Readers
     refers: AtomicUsize,
 }
 
+// The state that is shared amount Writer, Syncer, and multiple Readers.
 struct SharedState {
     dir: PathBuf,
 
-    // Update when rotating.
-    // Readers uses this.
+    // Writer updates this when rotating.
+    // Readers use this to scan files.
     data_files: RwLock<Vec<DataFile>>,
 
-    // Update when rotating.
-    // Syncer uses this.
+    // Writer inserts new file's clone into this when rotating.
+    // Syncer takes this.
     current_dup: Mutex<Option<File>>,
 
-    // Updated by Syncer.
+    // Syncer updates this after syncing.
     synced_seq: AtomicU64,
+
+    // Writer updates this after appending.
+    next_seq: AtomicU64,
 }
 
 /// SeqLog instance.
+///
+/// This is also the Writer.
 pub struct SeqLog {
+    _lock: File,
+
     state: Arc<SharedState>,
 
     // config
     rotate_size: usize,
     rotate_count: usize,
 
-    _lock: File,
-
-    // current file status
+    // Writer's current file status
     current: File,
     file_size: usize,
-    block_left: usize,
-
-    next_seq: u64,
 }
 
 impl SeqLog {
@@ -102,41 +105,24 @@ impl SeqLog {
         let (next_seq, file_size) = read_next_seq(&mut current)?;
         dbg!(next_seq);
 
-        let block_left = BLOCK_SIZE - (file_size % BLOCK_SIZE);
-
         let state = SharedState {
             dir: dir.to_path_buf(),
             data_files: RwLock::new(data_files),
-            current_dup: Mutex::new(Some(current.try_clone()?)),
+            current_dup: Mutex::new(None),
             synced_seq: AtomicU64::new(next_seq),
+            next_seq: AtomicU64::new(next_seq),
         };
 
         Ok(Self {
+            _lock: lock,
             state: Arc::new(state),
 
             rotate_size: 1024 * 1024 * 1024, // default value: 1G
             rotate_count: 20,                // default value: 20
-            _lock: lock,
 
             current,
             file_size,
-            block_left,
-            next_seq,
         })
-    }
-
-    /// Configrate rotation.
-    ///
-    /// `size`: Rotate a data file when it exceeds this size. The default value
-    /// is 1G. Setting to 0 means never rotating, and you can call [`Self::rotate`]
-    /// to rotate manaully.
-    ///
-    /// `count`: Number of files to retain. The default value is 20. Setting to
-    /// 0 means keeping all files, and you can call [`Self::purge`] to delete
-    /// manually.
-    pub fn set_rotate(&mut self, size: usize, count: usize) {
-        self.rotate_size = if size == 0 { usize::MAX } else { size };
-        self.rotate_count = if count == 0 { usize::MAX } else { count };
     }
 
     /// Append a batch of entries.
@@ -165,7 +151,10 @@ impl SeqLog {
         let mut lengths = Vec::with_capacity(entries.len()); // lengths for every entries
         let mut bufs = Vec::with_capacity(entries.len() + 2);
 
-        let mut block_left = self.block_left;
+        let origin_block_left = BLOCK_SIZE - (self.file_size % BLOCK_SIZE);
+        let mut block_left = origin_block_left;
+
+        let next_seq = self.next_seq();
 
         const ZEROS: [u8; LEN_SIZE] = [0; _];
         let dummy = IoSlice::new(&ZEROS);
@@ -196,7 +185,7 @@ impl SeqLog {
                 }
 
                 // new block
-                blocks.push((bufs.len(), (self.next_seq + i as u64).to_ne_bytes()));
+                blocks.push((bufs.len(), (next_seq + i as u64).to_ne_bytes()));
                 bufs.push(dummy); // hold the place for block header
 
                 block_left = BLOCK_SIZE - SEQ_SIZE;
@@ -222,7 +211,7 @@ impl SeqLog {
             bufs[*i] = IoSlice::new(seq);
         }
 
-        let total_len = blocks.len() * BLOCK_SIZE + self.block_left - block_left;
+        let total_len = blocks.len() * BLOCK_SIZE + origin_block_left - block_left;
 
         // finally, write into file
         let writen_len = self.current.write_vectored(&bufs)?;
@@ -236,16 +225,12 @@ impl SeqLog {
         }
 
         // update status
-        self.block_left = block_left;
-        self.next_seq += entries.len() as u64;
         self.file_size += total_len;
+        self.state
+            .next_seq
+            .fetch_add(entries.len() as u64, Ordering::Release);
 
         Ok(())
-    }
-
-    /// Synchronize new data onto disk.
-    pub fn sync(&self) -> Result<()> {
-        self.current.sync_data()
     }
 
     /// Remove files that contain only entries before the sequence number.
@@ -280,7 +265,7 @@ impl SeqLog {
     ///
     /// This does not check if any reader are reading these entries. TODO
     pub fn truncate(&mut self, after_seq: u64) -> Result<()> {
-        if after_seq >= self.next_seq {
+        if after_seq >= self.next_seq() {
             return Ok(());
         }
 
@@ -304,8 +289,9 @@ impl SeqLog {
 
             self.file_size = block_index * BLOCK_SIZE + block_pos;
             self.current.set_len(self.file_size as u64)?;
-            self.block_left = BLOCK_SIZE - block_pos;
-            self.next_seq = after_seq;
+
+            self.state.next_seq.store(after_seq, Ordering::Relaxed);
+            self.state.synced_seq.store(after_seq, Ordering::Relaxed);
 
         // after_seq is in older files
         } else {
@@ -317,18 +303,39 @@ impl SeqLog {
 
     /// Return the next sequence number.
     pub fn next_seq(&self) -> u64 {
-        self.next_seq
+        self.state.next_seq.load(Ordering::Relaxed)
     }
 
     pub fn synced_seq(&self) -> u64 {
         self.state.synced_seq.load(Ordering::Relaxed)
     }
 
+    /// Synchronize new data onto disk.
+    pub fn sync(&self) -> Result<()> {
+        self.current.sync_data()?;
+        self.state
+            .synced_seq
+            .store(self.next_seq(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Create a Syncer.
+    pub fn syncer(&self) -> Result<SeqLogSyncer> {
+        Ok(SeqLogSyncer {
+            state: self.state.clone(),
+            current: self.current.try_clone()?,
+        })
+    }
+
     /// Create a new [`SeqLogReader`] with the sequence number.
     pub fn reader(&self, next_seq: u64) -> Result<SeqLogReader> {
         let mut block_buf = Vec::new();
-        let (current, file_seq, block_pos) = // XXX file_no
-            seek_seq(&self.state.dir, &self.state.data_files, next_seq, &mut block_buf)?;
+        let (current, file_seq, block_pos) = seek_seq(
+            &self.state.dir,
+            &self.state.data_files,
+            next_seq,
+            &mut block_buf,
+        )?;
 
         Ok(SeqLogReader {
             state: self.state.clone(),
@@ -341,6 +348,20 @@ impl SeqLog {
         })
     }
 
+    /// Configrate rotation.
+    ///
+    /// `size`: Rotate a data file when it exceeds this size. The default value
+    /// is 1G. Setting to 0 means never rotating, and you can call [`Self::rotate`]
+    /// to rotate manaully.
+    ///
+    /// `count`: Number of files to retain. The default value is 20. Setting to
+    /// 0 means keeping all files, and you can call [`Self::purge`] to delete
+    /// manually.
+    pub fn set_rotate(&mut self, size: usize, count: usize) {
+        self.rotate_size = if size == 0 { usize::MAX } else { size };
+        self.rotate_count = if count == 0 { usize::MAX } else { count };
+    }
+
     /// Rotate the data file manually, e.g. by time or sequence number.
     ///
     /// Return the new file name, so you can handle it, such as make a symlink.
@@ -350,7 +371,9 @@ impl SeqLog {
     /// You should have called [`Self::set_rotate`] with `size=0` to disable
     /// the automatic rotation.
     pub fn rotate(&mut self) -> Result<PathBuf> {
-        let fname = file_name(&self.state.dir, self.next_seq);
+        let next_seq = self.next_seq();
+
+        let fname = file_name(&self.state.dir, next_seq);
         if self.file_size == SEQ_SIZE {
             // do not rotate if current file is empty
             return Ok(fname);
@@ -358,14 +381,13 @@ impl SeqLog {
 
         // open new file
         self.current = File::create_new(&fname)?;
-        self.current.write(&self.next_seq.to_ne_bytes())?;
+        self.current.write(&next_seq.to_ne_bytes())?;
 
         self.file_size = SEQ_SIZE;
-        self.block_left = BLOCK_SIZE - SEQ_SIZE;
 
         // save new file info
         let new_file = DataFile {
-            seq: self.next_seq,
+            seq: next_seq,
             refers: AtomicUsize::new(0),
         };
 
@@ -541,6 +563,24 @@ impl SeqLogReader {
         self.file_seq = file_seq;
         self.current = file;
         self.next_seq = seq;
+        Ok(())
+    }
+}
+
+pub struct SeqLogSyncer {
+    state: Arc<SharedState>,
+
+    current: File,
+}
+
+impl SeqLogSyncer {
+    pub fn sync(&mut self) -> Result<()> {
+        self.current.sync_data()?;
+
+        if let Some(new_file) = self.state.current_dup.lock().unwrap().take() {
+            self.current = new_file;
+            self.current.sync_data()?;
+        }
         Ok(())
     }
 }
