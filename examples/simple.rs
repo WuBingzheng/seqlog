@@ -3,10 +3,10 @@ use seqlog::SeqLog;
 use std::time::Instant;
 
 fn main() {
-    // let mut seqlog = SeqLog::create("target/example/run/", 1).unwrap();
-    let mut seqlog = SeqLog::open("target/example/run/").unwrap();
+    // let mut store = SeqLog::create("target/example/run/", 1).unwrap();
+    let mut store = SeqLog::open("target/example/run/").unwrap();
 
-    seqlog.set_rotate(1024 * 128, 20);
+    store.set_rotate(1024 * 128, 20);
 
     let entries = vec![
         "111",
@@ -28,13 +28,13 @@ fn main() {
 
     let start = Instant::now();
     for _ in 0..2 {
-        seqlog.append(&entries).unwrap();
+        store.append(&entries).unwrap();
     }
-    seqlog.sync().unwrap();
+    store.sync().unwrap();
     println!("{:?}", start.elapsed());
 
     let mut count = 0;
-    let mut reader = seqlog.reader(19).unwrap();
+    let mut reader = store.reader(store.next_seq() - 20).unwrap();
     while let Some(entry) = reader.next().unwrap() {
         count += 1;
 
@@ -51,9 +51,9 @@ fn main() {
     // ===
     let start = Instant::now();
     for _ in 0..2 {
-        seqlog.append(&entries).unwrap();
+        store.append(&entries).unwrap();
     }
-    seqlog.sync().unwrap();
+    store.sync().unwrap();
     println!("{:?}", start.elapsed());
 
     let mut count = 0;
@@ -71,6 +71,25 @@ fn main() {
     println!("EOF");
 
     // reset
-    // seqlog.reset(0xFFFF, "target/example/backup").unwrap();
-    // seqlog.append(&entries).unwrap();
+    // store.reset(0xFFFF, "target/example/backup").unwrap();
+    // store.append(&entries).unwrap();
+    // ==
+    let next_seq = store.next_seq();
+    store.truncate(next_seq - 10).unwrap();
+    println!("{} {}", next_seq, store.next_seq());
+
+    store.append(&entries[..1]).unwrap();
+
+    reader.reset(next_seq - 12).unwrap();
+    while let Some(entry) = reader.next().unwrap() {
+        count += 1;
+
+        match std::str::from_utf8(entry) {
+            Ok(s) => println!("{s}"),
+            Err(err) => {
+                println!("error: {err} {count} {}", entry.len());
+                return;
+            }
+        }
+    }
 }
