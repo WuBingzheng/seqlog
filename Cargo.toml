@@ -2,6 +2,12 @@
 name = "seqlog"
 version = "0.1.0"
 edition = "2024"
+authors = ["Wu Bingzheng <wubingzheng@gmail.com>"]
+description = "An embedded append-only sequence log store."
+license = "MIT"
+repository = "https://github.com/WuBingzheng/seqlog"
+documentation = "https://docs.rs/seqlog"
+keywords = ["log", "storage", "embedded", "append-only", "database"]
+categories = ["database-implementations"]
 
 [dependencies]
-#memmap = "0.7"
