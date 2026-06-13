@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +27,7 @@ struct DataFile {
     refers: AtomicUsize,
 }
 
+/// SeqLog instance.
 pub struct SeqLog {
     path: PathBuf,
 
@@ -32,16 +35,25 @@ pub struct SeqLog {
     rotate_size: usize,
     rotate_count: usize,
 
+    // files
     _lock: File,
     data_files: Arc<RwLock<Vec<DataFile>>>,
+
+    // current file status
     current: File,
     file_size: usize,
     block_left: usize,
+
     next_seq: u64,
 }
 
 impl SeqLog {
-    /// Create a SeqLog instance with start_seq, and open it.
+    /// Create a SeqLog instance with start sequence number, and open it.
+    ///
+    /// This mainly creates a directory using [`std::fs::create_dir`],
+    /// which requires that the parent directory of the given path already
+    /// exists and the path itself does not exist. It's equvalent to `mkdir`
+    /// without `-p`.
     pub fn create<P: AsRef<Path>>(path: P, start_seq: u64) -> Result<Self> {
         let path = path.as_ref();
 
@@ -56,7 +68,7 @@ impl SeqLog {
         Self::open(path)
     }
 
-    /// Open a SeqLog instance.
+    /// Open an existing SeqLog instance.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
@@ -71,7 +83,10 @@ impl SeqLog {
         let block_left = BLOCK_SIZE - (file_size % BLOCK_SIZE);
         dbg!(next_seq);
 
-        let current = File::options().append(true).open(&current_info.path)?;
+        let current = File::options()
+            .read(true)
+            .append(true)
+            .open(&current_info.path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -87,24 +102,41 @@ impl SeqLog {
     }
 
     /// Configrate rotation.
+    ///
+    /// `size`: Rotate a data file when it exceeds this size. The default value
+    /// is 1G. Setting to 0 means never rotating, and you can call [`Self::rotate`]
+    /// to rotate manaully.
+    ///
+    /// `count`: Number of files to retain. The default value is 20. Setting to
+    /// 0 means keeping all files, and you can call [`Self::purge`] to delete
+    /// manually.
     pub fn set_rotate(&mut self, size: usize, count: usize) {
         self.rotate_size = if size == 0 { usize::MAX } else { size };
         self.rotate_count = if count == 0 { usize::MAX } else { count };
     }
 
-    // block header:
-    //   +8--------+
-    //   | seq     |
-    //   +---------+
-    //
-    // entry format:
-    //   +2--+----------------+
-    //   |len|entry           |
-    //   +---+----------------+
+    /// Append a batch of entries.
+    ///
+    /// Return `ErrorKind::InvalidData` if any entry is empty (length=0) or
+    /// longer than 65526 (64K - 10).
+    ///
+    /// This issues one `write(2)` syscall. Therefore, appending in batches
+    /// reduces the number of system calls.
+    ///
+    /// This writes data into file (page cache), but does not synchronize
+    /// disk. You should call [`Self::sync`] if needed.
     pub fn append<T>(&mut self, entries: &[T]) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
+        // check rotation
+        //
+        // We can not check and rotate at the tail of this function, because
+        // that may close the current file and user can not call sync() on it.
+        if self.file_size >= self.rotate_size {
+            self.rotate()?;
+        }
+
         let mut blocks = Vec::new(); // block header: start seq
         let mut lengths = Vec::with_capacity(entries.len()); // lengths for every entries
         let mut bufs = Vec::with_capacity(entries.len() + 2);
@@ -184,22 +216,86 @@ impl SeqLog {
         self.next_seq += entries.len() as u64;
         self.file_size += total_len;
 
-        // check rotation
-        if self.file_size >= self.rotate_size {
-            self.rotate()?;
+        Ok(())
+    }
+
+    /// Synchronize new data onto disk.
+    pub fn sync(&self) -> Result<()> {
+        self.current.sync_data()
+    }
+
+    /// Remove files that contain only entries before the sequence number.
+    ///
+    /// If a data file contains entries both before and after the sequence
+    /// number, it will not be removed.
+    ///
+    /// If a data file is in read by any reader, it will not be removed.
+    pub fn purge(&mut self, before_seq: u64) -> Result<()> {
+        let mut data_files = self.data_files.write().unwrap();
+
+        let mut until = data_files.len() - 1;
+        for (i, data_file) in data_files.iter().enumerate() {
+            if data_file.start_seq > before_seq {
+                until = i.saturating_sub(1);
+                break;
+            }
+            if data_file.refers.load(Ordering::Relaxed) != 0 {
+                until = i;
+                break;
+            }
+        }
+
+        for data_file in data_files.drain(..until) {
+            fs::remove_file(data_file.path)?;
+        }
+        Ok(())
+    }
+
+    /// Truncate entries exactly after the sequence number.
+    ///
+    /// This does not check if any reader are reading these entries. TODO
+    pub fn truncate(&mut self, after_seq: u64) -> Result<()> {
+        if after_seq >= self.next_seq {
+            return Ok(());
+        }
+
+        let current_start_seq = read_block_seq(&mut self.current, 0)?;
+
+        // after_seq is in current file
+        if current_start_seq <= after_seq {
+            // locate block in file
+            let (block_index, block_seq) =
+                locate_block(&mut self.current, current_start_seq, after_seq)?;
+
+            // locate entry in block
+            let mut block_buf = Vec::new();
+            let block_pos = locate_entry(
+                &mut self.current,
+                &mut block_buf,
+                block_index,
+                block_seq,
+                after_seq,
+            )?;
+
+            self.file_size = block_index * BLOCK_SIZE + block_pos;
+            self.current.set_len(self.file_size as u64)?;
+            self.block_left = BLOCK_SIZE - block_pos;
+            self.next_seq = after_seq;
+
+        // after_seq is in older files
+        } else {
+            todo!();
         }
 
         Ok(())
     }
 
-    pub fn sync(&self) -> Result<()> {
-        self.current.sync_data()
-    }
-
+    /// Return the next sequence number.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
 
+    /// Create a new [`SeqLogReader`] with the start sequence number.
     pub fn reader(&self, start_seq: u64) -> Result<SeqLogReader> {
         let mut block_buf = Vec::new();
         let (file, file_no, block_pos) = seek_seq(&self.data_files, start_seq, &mut block_buf)?;
@@ -215,6 +311,10 @@ impl SeqLog {
         })
     }
 
+    /// Rotate the data file manually, e.g. by time or sequence number.
+    ///
+    /// You should have called [`Self::set_rotate`] with `size=0` to disable
+    /// the automatic rotation.
     pub fn rotate(&mut self) -> Result<PathBuf> {
         // open new file
         let new_file_no = self.data_files.read().unwrap().last().unwrap().file_no + 1;
@@ -250,6 +350,15 @@ impl SeqLog {
         Ok(path)
     }
 
+    /// Remove all data and start at the new sequence number.
+    ///
+    /// This renames the directory to `backup_dir`, creates a new SeqLog instance,
+    /// and replaces `self` with the new instance.
+    ///
+    /// All entries in SeqLog must have contiguous sequence numbers. When you
+    /// need to skip some sequence numbers (e.g., after loading a new snapshot),
+    /// the only way is to clean up the old data and create a new SeqLog
+    /// instance starting from the new sequence number using this method.
     pub fn reset<P: AsRef<Path>>(&mut self, start_seq: u64, backup_dir: P) -> Result<()> {
         fs::rename(&self.path, backup_dir)?;
 
@@ -265,6 +374,25 @@ fn read_block_seq(file: &mut File, block: usize) -> Result<u64> {
     Ok(u64::from_ne_bytes(buf))
 }
 
+/// A sequential reader for scanning entries in a SeqLog.
+///
+/// Compared with key-value stores, SeqLog has two characteristics for reading:
+///
+/// 1. Seeking to an arbitrary sequence number is not that fast bacause
+///    it uses sparse index;
+/// 2. Once positioned, sequential reads are very efficient because entries
+///    are stored in sequence order.
+///
+/// This access pattern is similar to a hard disk (HDD).
+/// A `SeqLogReader` acts like the disk read head. It is positioned at the
+/// specific sequence number when created (by [`SeqLog::reader`]).
+/// Subsequent reads (by [`Self::next`]) continue sequentially from that
+/// position.
+///
+/// Each reader maintains its own read position. Multiple readers can
+/// coexist and scan the log independently.
+///
+/// The reader can be sent between threads.
 pub struct SeqLogReader {
     data_files: Arc<RwLock<Vec<DataFile>>>,
 
@@ -276,26 +404,7 @@ pub struct SeqLogReader {
 }
 
 impl SeqLogReader {
-    pub fn reset_seq(&mut self, seq: u64) -> Result<()> {
-        let (file, file_no, block_pos) = seek_seq(&self.data_files, seq, &mut self.block_buf)?;
-
-        // unlock original file
-        let data_files = self.data_files.read().unwrap();
-        let data_file = data_files
-            .iter()
-            .rev()
-            .find(|&f| f.file_no == self.file_no)
-            .unwrap();
-        data_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
-
-        // update
-        self.block_pos = block_pos;
-        self.current = file;
-        self.file_no = file_no;
-        self.next_seq = seq;
-        Ok(())
-    }
-
+    /// Return the next entry.
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
         // check any entry in current block
         if let Some(len) = parse_entry_len(&self.block_buf[self.block_pos..]) {
@@ -365,11 +474,39 @@ impl SeqLogReader {
         self.next()
     }
 
+    /// Return the next sequence number.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
+
+    /// Reset the sequence number. Then [`Self::next`] will return
+    /// the entry with this sequence number later.
+    ///
+    /// This also resets the entire SeqLogReader instance.
+    ///
+    /// This is expensive and you should not call this often.
+    pub fn reset(&mut self, seq: u64) -> Result<()> {
+        let (file, file_no, block_pos) = seek_seq(&self.data_files, seq, &mut self.block_buf)?;
+
+        // unlock original file
+        let data_files = self.data_files.read().unwrap();
+        let data_file = data_files
+            .iter()
+            .rev()
+            .find(|&f| f.file_no == self.file_no)
+            .unwrap();
+        data_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
+
+        // update
+        self.block_pos = block_pos;
+        self.current = file;
+        self.file_no = file_no;
+        self.next_seq = seq;
+        Ok(())
+    }
 }
 
+// seek the sequence number in all data files
 fn seek_seq(
     arc_data_files: &Arc<RwLock<Vec<DataFile>>>,
     seq: u64,
@@ -411,6 +548,7 @@ fn seek_seq(
     Ok((file, file_no, block_pos))
 }
 
+// seek the sequence number in one data file
 fn seek_seq_in_file(
     path: &Path,
     start_seq: u64,
@@ -428,6 +566,7 @@ fn seek_seq_in_file(
     Ok((file, block_pos))
 }
 
+// locate the block in the file
 fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64)> {
     assert!(start_seq <= seq);
 
@@ -471,6 +610,7 @@ fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64
     unreachable!("no block found");
 }
 
+// locate the entry in the block
 fn locate_entry(
     file: &mut File,
     block_buf: &mut Vec<u8>,
@@ -496,6 +636,7 @@ fn locate_entry(
     Ok(pos)
 }
 
+// load all data files
 fn load_data_files(dir: &Path) -> Result<Vec<DataFile>> {
     let mut files = Vec::new();
     let mut seq_buf: [u8; SEQ_SIZE] = [0; _];
@@ -548,6 +689,7 @@ fn load_data_files(dir: &Path) -> Result<Vec<DataFile>> {
     Ok(files)
 }
 
+// read last sequence number
 fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
     let mut file = File::open(fname)?;
 
@@ -577,10 +719,12 @@ fn read_file_info(fname: &Path) -> Result<(u64, usize)> {
     Ok((next_seq, len))
 }
 
+// build data file name
 fn file_name(file_no: u64) -> String {
     format!("{:08}{}", file_no, SUBFIX)
 }
 
+// parse next entry's length, if any
 fn parse_entry_len(buf: &[u8]) -> Option<usize> {
     if buf.len() < LEN_SIZE {
         None
@@ -590,6 +734,7 @@ fn parse_entry_len(buf: &[u8]) -> Option<usize> {
     }
 }
 
+// parse sequence number
 fn parse_seq(buf: &[u8]) -> u64 {
     u64::from_ne_bytes(buf[0..SEQ_SIZE].try_into().unwrap())
 }
