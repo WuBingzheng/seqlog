@@ -575,12 +575,19 @@ pub struct SeqLogSyncer {
 
 impl SeqLogSyncer {
     pub fn sync(&mut self) -> Result<()> {
+        // load next_seq before sync()
+        let mut next_seq = self.state.next_seq.load(Ordering::Acquire);
+
         self.current.sync_data()?;
 
         if let Some(new_file) = self.state.current_dup.lock().unwrap().take() {
+            next_seq = self.state.next_seq.load(Ordering::Acquire);
             self.current = new_file;
             self.current.sync_data()?;
         }
+
+        // store synced_seq after sync()
+        self.state.synced_seq.store(next_seq, Ordering::Release);
         Ok(())
     }
 }
