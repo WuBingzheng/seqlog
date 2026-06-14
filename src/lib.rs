@@ -668,6 +668,7 @@ fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64
                 return Ok((i, blk_seq));
             }
         }
+        unreachable!("no block found");
     } else if guess_block_seq < seq {
         // search forward
         let mut last_block_seq = guess_block_seq;
@@ -678,11 +679,10 @@ fn locate_block(file: &mut File, start_seq: u64, seq: u64) -> Result<(usize, u64
             }
             last_block_seq = blk_seq;
         }
+        Ok((guess_block_index, guess_block_seq))
     } else {
-        return Ok((guess_block_index, guess_block_seq));
+        Ok((guess_block_index, guess_block_seq))
     }
-
-    unreachable!("no block found");
 }
 
 // locate the entry in the block
@@ -757,7 +757,6 @@ fn read_next_seq(file: &mut File) -> Result<(u64, usize)> {
 
     // parse block header: start seq
     let mut next_seq = parse_seq(&block);
-    dbg!(next_seq);
 
     // parse entries
     let mut entry = &block[SEQ_SIZE..];
