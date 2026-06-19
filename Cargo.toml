@@ -11,3 +11,4 @@ keywords = ["log", "storage", "embedded", "append-only", "database"]
 categories = ["database-implementations"]
 
 [dependencies]
+crc32fast = "1.5"
