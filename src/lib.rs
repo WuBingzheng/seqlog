@@ -65,6 +65,7 @@ pub struct SeqLog {
     current_data: File,
     current_index: File,
     data_file_size: usize,
+    file_seq: u64,
 }
 
 impl SeqLog {
@@ -103,16 +104,17 @@ impl SeqLog {
             return Err(Error::new(ErrorKind::InvalidData, "no data file"));
         };
 
-        let fname = data_file_name(dir, current_data_file.seq);
+        let file_seq = current_data_file.seq;
+
+        let fname = data_file_name(dir, file_seq);
         let mut current_data = File::options().append(true).read(true).open(fname)?;
 
-        let fname = index_file_name(dir, current_data_file.seq);
+        let fname = index_file_name(dir, file_seq);
         let mut current_index = File::options().append(true).read(true).open(fname)?;
 
         let (count, file_size) = check_current_file(&mut current_data, &mut current_index)?;
 
-        let next_seq = current_data_file.seq + count;
-        dbg!(current_data_file.seq);
+        let next_seq = file_seq + count;
         let data_file_size = file_size as usize;
         dbg!(next_seq);
 
@@ -134,6 +136,7 @@ impl SeqLog {
             current_data,
             current_index,
             data_file_size,
+            file_seq,
         })
     }
 
@@ -186,7 +189,7 @@ impl SeqLog {
             total_len += HEADER_SIZE + len;
 
             next_seq += 1;
-            if next_seq % INDEX_INTERVAL == 0 {
+            if (next_seq - self.file_seq) % INDEX_INTERVAL == 0 {
                 let offset = self.data_file_size + total_len;
                 append_index(&mut self.current_index, offset as u64)?;
             }
@@ -368,6 +371,7 @@ impl SeqLog {
         self.current_index = File::create_new(index_file_name(&self.state.dir, next_seq))?;
 
         self.data_file_size = 0;
+        self.file_seq = next_seq;
 
         // save new file info
         let new_file = DataFile {
