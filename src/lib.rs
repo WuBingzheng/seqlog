@@ -183,7 +183,7 @@ impl SeqLog {
             bufs.push(IoSlice::new(&[])); // hold the place
             bufs.push(IoSlice::new(&[])); // hold the place
 
-            // encode the entry
+            // encode the payload
             bufs.push(IoSlice::new(entry));
 
             total_len += HEADER_SIZE + len;
@@ -196,9 +196,9 @@ impl SeqLog {
         }
 
         // fix headers in buf
-        for (i, (len_buf, chs_buf)) in lengths.iter().zip(chsums.iter()).enumerate() {
-            bufs[i * 3] = IoSlice::new(len_buf);
-            bufs[i * 3 + 1] = IoSlice::new(chs_buf);
+        for i in 0..entries.len() {
+            bufs[i * 3] = IoSlice::new(&lengths[i]);
+            bufs[i * 3 + 1] = IoSlice::new(&chsums[i]);
         }
 
         // finally, write into file
@@ -453,13 +453,22 @@ pub struct SeqLogReader {
 impl SeqLogReader {
     /// Return the next entry.
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
-        dbg!(self.next_seq);
         // check any entry in current data buffer
         if let Some(len) = parse_entry_len(&self.data_buf[self.data_pos..]) {
             // yes, happy path
+            let entry = &self.data_buf[self.data_pos..];
+            let payload = &entry[HEADER_SIZE..HEADER_SIZE + len];
+
+            // check checksum
+            let chsum1 = parse_checksum(&entry[LEN_SIZE..]);
+            let chsum2 = hash(&payload) as u16;
+            if chsum1 != chsum2 {
+                return error("invalid checksum");
+            }
+
             self.next_seq += 1;
             self.data_pos += HEADER_SIZE + len;
-            return Ok(Some(&self.data_buf[self.data_pos - len..self.data_pos]));
+            return Ok(Some(payload));
         }
 
         // read more from data file
@@ -468,71 +477,12 @@ impl SeqLogReader {
 
         let len = self.current.read(&mut self.data_buf[remain_len..])?;
         if len == 0 {
-            todo!("EOF");
+            return Ok(None);
         }
         self.data_buf.truncate(remain_len + len);
         self.data_pos = 0;
 
         self.next() // TODO
-
-        /*
-        // read more data
-
-        // If the current block is full-size, read the next block into
-        // block_buf (buf_base=0).
-        // If non-full-size block, this block was the end of the file
-        // when read, but by now, there maybe new data appended, so we
-        // try to read more data into the bottom of the block_buf.
-        let mut buf_base = 0;
-        if self.block_buf.len() != BLOCK_SIZE {
-            buf_base = self.block_buf.len();
-            self.block_buf.resize(BLOCK_SIZE, 0);
-        }
-
-        let mut read_len = self.current.read(&mut self.block_buf[buf_base..])?;
-
-        // if read nothing, try to open new file
-        if read_len == 0 {
-            // search the next file
-            // TODO optimize this, this is very often
-            let data_files = self.state.data_files.read().unwrap();
-            let Ok(i) = data_files.binary_search_by(|f| f.seq.cmp(&self.next_seq)) else {
-                // no more file, roll back the block_buf and return EOF
-                if buf_base != 0 {
-                    self.block_buf.truncate(buf_base);
-                }
-                return Ok(None);
-            };
-
-            // TODO if same file, do not open
-
-            // open new file
-            self.current = File::open(file_name(&self.state.dir, data_files[i].seq))?;
-
-            // read the first block
-            read_len = self.current.read(&mut self.block_buf)?;
-
-            // reset because of new block
-            buf_base = 0;
-        }
-
-        self.block_buf.truncate(buf_base + read_len);
-
-        // if new block
-        if buf_base == 0 {
-            // check new block's start-seq
-            let start_seq = parse_seq(&self.block_buf);
-            if start_seq != self.next_seq {
-                return Err(Error::new(ErrorKind::InvalidData, "non-consecutive seq"));
-            }
-
-            // reset
-            self.block_pos = SEQ_SIZE;
-        }
-
-        // try recursively
-        self.next()
-        */
     }
 
     /// Return the next sequence number.
@@ -616,7 +566,6 @@ fn seek_seq(
 
     data_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
 
-    dbg!(data_pos);
     Ok((file, data_file.seq, data_pos))
 }
 
@@ -630,7 +579,6 @@ fn seek_seq_in_file(
 
     // seek by index
     let diff_seq = seq - file_seq;
-    dbg!(file_seq, seq, diff_seq);
     if diff_seq >= INDEX_INTERVAL {
         let mut index_file = File::open(index_file_name(dir, file_seq))?;
         index_file.seek(SeekFrom::Start(
@@ -641,7 +589,6 @@ fn seek_seq_in_file(
         index_file.read_exact(&mut index_buf)?;
 
         let offset = read_index(&index_buf);
-        dbg!(offset);
 
         // seek the data file to the offset
         data_file.seek(SeekFrom::Start(offset))?;
@@ -650,7 +597,6 @@ fn seek_seq_in_file(
     // read data file
     data_buf.resize(READBUF_SIZE, 0);
     let len = data_file.read(data_buf)?;
-    dbg!(len);
     if len == 0 {
         return error("seq not found 1");
     }
@@ -660,8 +606,6 @@ fn seek_seq_in_file(
     if count == 0 {
         return Ok((data_file, 0));
     }
-
-    dbg!(count);
 
     loop {
         let mut data_pos = 0;
@@ -674,7 +618,6 @@ fn seek_seq_in_file(
         }
 
         if data_buf.len() < READBUF_SIZE {
-            dbg!(file_seq, data_buf.len(), data_pos, count);
             return error("seq not found 2");
         }
 
@@ -738,7 +681,6 @@ fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u6
 
         count = (index_file_len / INDEX_SIZE) as u64 * INDEX_INTERVAL;
     }
-    dbg!(count);
 
     // read data
     let mut data_buf = Vec::new();
@@ -756,7 +698,6 @@ fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u6
             append_index(index_file, offset)?;
         }
     }
-    dbg!(count);
 
     Ok((count, offset))
 }
@@ -784,6 +725,10 @@ fn parse_entry_len(buf: &[u8]) -> Option<usize> {
         return None;
     }
     Some(len)
+}
+
+fn parse_checksum(buf: &[u8]) -> u16 {
+    u16::from_ne_bytes(buf[0..CHSUM_SIZE].try_into().unwrap())
 }
 
 fn error<T>(detail: impl Into<String>) -> Result<T> {
