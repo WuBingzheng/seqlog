@@ -1,28 +1,24 @@
 #![doc = include_str!("../README.md")]
 
-use crc32fast::Hasher;
+use crc32fast::hash;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
-
 const DATA_SUFFIX: &'static str = ".data";
 const INDEX_SUFFIX: &'static str = ".index";
 const LOCK_FILE: &'static str = "LOCK";
 
-const INDEX_INTERVAL: u64 = 256;
+const INDEX_INTERVAL: u64 = 1024;
 
-const FIRST_INDEX: [u8; INDEX_SIZE] = [0; _];
+const READBUF_SIZE: usize = 128 * 1024; // bigger that ENTRY_MAX_LEN
 
 const LEN_SIZE: usize = std::mem::size_of::<u16>();
-const CRC_SIZE: usize = 4;
-const INDEX_SIZE: usize = 8 + CRC_SIZE;
+const CHSUM_SIZE: usize = 2;
+const HEADER_SIZE: usize = LEN_SIZE + CHSUM_SIZE;
+const INDEX_SIZE: usize = std::mem::size_of::<u64>();
 
 const ENTRY_MAX_LEN: usize = u16::MAX as usize;
 
@@ -69,7 +65,6 @@ pub struct SeqLog {
     current_data: File,
     current_index: File,
     data_file_size: usize,
-    hasher: Hasher,
 }
 
 impl SeqLog {
@@ -89,7 +84,7 @@ impl SeqLog {
 
         // first empty data file and index file
         File::create(data_file_name(dir, start_seq))?;
-        new_index_file(dir, start_seq)?;
+        File::create(index_file_name(dir, start_seq))?;
 
         Self::open(dir)
     }
@@ -114,11 +109,12 @@ impl SeqLog {
         let fname = index_file_name(dir, current_data_file.seq);
         let mut current_index = File::options().append(true).read(true).open(fname)?;
 
-        let (count, hasher) = count_entries(&mut current_data, &mut current_index)?;
-        let next_seq = current_data_file.seq + count;
-        dbg!(next_seq);
+        let (count, file_size) = check_current_file(&mut current_data, &mut current_index)?;
 
-        let data_file_size = current_data.metadata()?.len() as usize;
+        let next_seq = current_data_file.seq + count;
+        dbg!(current_data_file.seq);
+        let data_file_size = file_size as usize;
+        dbg!(next_seq);
 
         let state = SharedState {
             dir: dir.to_path_buf(),
@@ -138,7 +134,6 @@ impl SeqLog {
             current_data,
             current_index,
             data_file_size,
-            hasher,
         })
     }
 
@@ -165,6 +160,7 @@ impl SeqLog {
         }
 
         let mut lengths = Vec::with_capacity(entries.len());
+        let mut chsums = Vec::with_capacity(entries.len());
         let mut bufs = Vec::with_capacity(entries.len() * 2);
 
         let mut total_len = 0;
@@ -174,48 +170,32 @@ impl SeqLog {
             let entry = entry.as_ref();
             let len = entry.len();
 
-            if len == 0 {
-                return Err(Error::new(ErrorKind::InvalidData, "empty entry"));
-            }
             if len > ENTRY_MAX_LEN {
                 return Err(Error::new(ErrorKind::InvalidData, "too long entry"));
             }
 
             // encode the length
             lengths.push((len as u16).to_ne_bytes());
+            chsums.push((hash(entry) as u16).to_ne_bytes());
             bufs.push(IoSlice::new(&[])); // hold the place
-            self.hasher.update(lengths.last().unwrap());
+            bufs.push(IoSlice::new(&[])); // hold the place
 
             // encode the entry
             bufs.push(IoSlice::new(entry));
-            self.hasher.update(entry);
 
-            total_len += len + LEN_SIZE;
+            total_len += HEADER_SIZE + len;
 
             next_seq += 1;
             if next_seq % INDEX_INTERVAL == 0 {
-                let mut hasher = std::mem::take(&mut self.hasher);
-
-                // update index file
-                let offset_buf = ((self.data_file_size + total_len) as u64).to_ne_bytes();
-
-                dbg!(next_seq);
-
-                hasher.update(&offset_buf);
-                let chsum = hasher.finalize();
-                let chsum_buf = chsum.to_ne_bytes();
-
-                let mut index_buf = [0; INDEX_SIZE];
-                index_buf[..8].copy_from_slice(&offset_buf);
-                index_buf[8..].copy_from_slice(&chsum_buf);
-
-                self.current_index.write(&index_buf)?;
+                let offset = self.data_file_size + total_len;
+                append_index(&mut self.current_index, offset as u64)?;
             }
         }
 
-        // fix lengths in buf
-        for (i, len_buf) in lengths.iter().enumerate() {
-            bufs[i * 2] = IoSlice::new(len_buf);
+        // fix headers in buf
+        for (i, (len_buf, chs_buf)) in lengths.iter().zip(chsums.iter()).enumerate() {
+            bufs[i * 3] = IoSlice::new(len_buf);
+            bufs[i * 3 + 1] = IoSlice::new(chs_buf);
         }
 
         // finally, write into file
@@ -332,21 +312,18 @@ impl SeqLog {
 
     /// Create a new [`SeqLogReader`] with the sequence number.
     pub fn reader(&self, next_seq: u64) -> Result<SeqLogReader> {
-        let mut index_buf = Vec::new();
         let mut data_buf = Vec::new();
 
         let (current, file_seq, data_pos) = seek_seq(
             &self.state.dir,
             &self.state.data_files,
             next_seq,
-            &mut index_buf,
             &mut data_buf,
         )?;
 
         Ok(SeqLogReader {
             state: self.state.clone(),
             data_buf,
-            index_buf,
 
             current,
             file_seq,
@@ -388,7 +365,7 @@ impl SeqLog {
 
         // open new file
         self.current_data = File::create_new(&data_fname)?;
-        self.current_index = new_index_file(&self.state.dir, next_seq)?;
+        self.current_index = File::create_new(index_file_name(&self.state.dir, next_seq))?;
 
         self.data_file_size = 0;
 
@@ -436,21 +413,8 @@ impl SeqLog {
     }
 }
 
-fn read_index(file: &mut File, i: usize) -> Result<(u64, u32)> {
-    let mut buf: [u8; INDEX_SIZE] = [0; _];
-    file.read_exact_at(&mut buf, (i * INDEX_SIZE) as u64)?;
-    let offset = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-    let crc = u32::from_ne_bytes(buf[8..].try_into().unwrap());
-    Ok((offset, crc))
-}
-fn read_index2(index_buf: &[u8], i: usize) -> Option<(u64, u32)> {
-    if index_buf.len() <= i * INDEX_SIZE {
-        return None;
-    }
-    let buf = &index_buf[i * INDEX_SIZE..];
-    let offset = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-    let crc = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
-    Some((offset, crc))
+fn read_index(buf: &[u8]) -> u64 {
+    u64::from_ne_bytes(buf[..8].try_into().unwrap())
 }
 
 /// A sequential reader for scanning entries in a SeqLog.
@@ -477,7 +441,6 @@ pub struct SeqLogReader {
 
     current: File,
     file_seq: u64,
-    index_buf: Vec<u8>,
     data_buf: Vec<u8>,
     data_pos: usize,
     next_seq: u64,
@@ -486,15 +449,27 @@ pub struct SeqLogReader {
 impl SeqLogReader {
     /// Return the next entry.
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
+        dbg!(self.next_seq);
         // check any entry in current data buffer
         if let Some(len) = parse_entry_len(&self.data_buf[self.data_pos..]) {
             // yes, happy path
             self.next_seq += 1;
-            self.data_pos += LEN_SIZE + len;
+            self.data_pos += HEADER_SIZE + len;
             return Ok(Some(&self.data_buf[self.data_pos - len..self.data_pos]));
         }
 
-        todo!()
+        // read more from data file
+        let remain_len = self.data_buf.len() - self.data_pos;
+        self.data_buf.copy_within(self.data_pos.., 0);
+
+        let len = self.current.read(&mut self.data_buf[remain_len..])?;
+        if len == 0 {
+            todo!("EOF");
+        }
+        self.data_buf.truncate(remain_len + len);
+        self.data_pos = 0;
+
+        self.next() // TODO
 
         /*
         // read more data
@@ -572,7 +547,6 @@ impl SeqLogReader {
             &self.state.dir,
             &self.state.data_files,
             seq,
-            &mut self.index_buf,
             &mut self.data_buf,
         )?;
 
@@ -622,7 +596,6 @@ fn seek_seq(
     dir: &Path,
     arc_data_files: &RwLock<Vec<DataFile>>,
     seq: u64,
-    index_buf: &mut Vec<u8>,
     data_buf: &mut Vec<u8>,
 ) -> Result<(File, u64, usize)> {
     // if seq > self.main.next_seq {
@@ -635,82 +608,80 @@ fn seek_seq(
         return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
     };
 
+    let (file, data_pos) = seek_seq_in_file(dir, data_file.seq, seq, data_buf)?;
+
     data_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
 
-    // unlock the data_files ASAP
-    let file_seq = data_file.seq;
-    drop(data_files);
-
-    // seek the seq in the file
-    let (file, data_pos) = match seek_seq_in_file(dir, file_seq, seq, index_buf, data_buf) {
-        Ok((file, data_pos)) => (file, data_pos),
-        Err(err) => {
-            // roll back the lock
-            let data_files = arc_data_files.read().unwrap();
-            let data_file = data_files.iter().rev().find(|&f| f.seq <= seq).unwrap();
-            data_file.refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
-            return Err(err);
-        }
-    };
-
-    Ok((file, file_seq, data_pos))
+    dbg!(data_pos);
+    Ok((file, data_file.seq, data_pos))
 }
 
-// seek the sequence number in one data file
 fn seek_seq_in_file(
     dir: &Path,
     file_seq: u64,
     seq: u64,
-    index_buf: &mut Vec<u8>,
     data_buf: &mut Vec<u8>,
 ) -> Result<(File, usize)> {
-    let diff_seq = seq - file_seq;
-    let ii = diff_seq / INDEX_INTERVAL; // index of index
-
-    let mut index_file = File::open(index_file_name(dir, file_seq))?;
-    index_file.seek(SeekFrom::Start(ii * INDEX_SIZE as u64))?;
-    index_file.read_to_end(index_buf)?;
-
-    dbg!(seq, file_seq, diff_seq, ii, index_buf.len());
-
-    if index_buf.len() == 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid index 1"));
-    }
-    if index_buf.len() % INDEX_SIZE != 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid index 2"));
-    }
-
-    // data file
-    let (start_offset, _) = read_index2(index_buf, 0).unwrap();
     let mut data_file = File::open(data_file_name(dir, file_seq))?;
-    data_file.seek(SeekFrom::Start(start_offset))?;
 
-    if let Some((end_offset, chsum)) = read_index2(index_buf, 1) {
-        data_buf.resize((end_offset - start_offset) as usize, 0);
-        data_file.read_exact(data_buf)?;
+    // seek by index
+    let diff_seq = seq - file_seq;
+    dbg!(file_seq, seq, diff_seq);
+    if diff_seq >= INDEX_INTERVAL {
+        let mut index_file = File::open(index_file_name(dir, file_seq))?;
+        index_file.seek(SeekFrom::Start(
+            (diff_seq / INDEX_INTERVAL - 1) * INDEX_SIZE as u64,
+        ))?;
 
-        // check checksum
-        let mut hasher = Hasher::new();
-        hasher.update(data_buf);
-        let offset_buf = &index_buf[ii as usize * INDEX_SIZE..];
-        hasher.update(&offset_buf[..8]);
-        if hasher.finalize() != chsum {
-            return Err(Error::new(ErrorKind::InvalidData, "invalid checksum"));
+        let mut index_buf = [0; INDEX_SIZE];
+        index_file.read_exact(&mut index_buf)?;
+
+        let offset = read_index(&index_buf);
+        dbg!(offset);
+
+        // seek the data file to the offset
+        data_file.seek(SeekFrom::Start(offset))?;
+    }
+
+    // read data file
+    data_buf.resize(READBUF_SIZE, 0);
+    let len = data_file.read(data_buf)?;
+    dbg!(len);
+    if len == 0 {
+        return error("seq not found 1");
+    }
+    data_buf.truncate(len);
+
+    let mut count = diff_seq % INDEX_INTERVAL;
+    if count == 0 {
+        return Ok((data_file, 0));
+    }
+
+    dbg!(count);
+
+    loop {
+        let mut data_pos = 0;
+        while let Some(len) = parse_entry_len(&data_buf[data_pos..]) {
+            data_pos += HEADER_SIZE + len;
+            count -= 1;
+            if count == 0 {
+                return Ok((data_file, data_pos));
+            }
         }
-    } else {
-        data_buf.clear();
-        data_file.read_to_end(data_buf)?;
-    }
 
-    let mut data_pos = 0;
-    for _ in 0..(diff_seq % INDEX_INTERVAL) as usize {
-        let Some(len) = parse_entry_len(&data_buf[data_pos..]) else {
-            return Err(Error::new(ErrorKind::InvalidData, "invalid checksum"));
-        };
-        data_pos += LEN_SIZE + len;
-    }
+        if data_buf.len() < READBUF_SIZE {
+            dbg!(file_seq, data_buf.len(), data_pos, count);
+            return error("seq not found 2");
+        }
 
-    Ok((data_file, data_pos))
+        data_buf.copy_within(data_pos.., 0);
+
+        let len = data_file.read(&mut data_buf[READBUF_SIZE - data_pos..])?;
+        if len == 0 {
+            return error("seq not found 3");
+        }
+        data_buf.truncate(READBUF_SIZE - data_pos + len);
+    }
 }
 
 fn list_data_files(dir: &Path) -> Result<Vec<DataFile>> {
@@ -742,36 +713,52 @@ fn list_data_files(dir: &Path) -> Result<Vec<DataFile>> {
     Ok(files)
 }
 
-fn count_entries(data_file: &mut File, index_file: &mut File) -> Result<(u64, Hasher)> {
-    let len = index_file.metadata()?.len() as usize;
-
-    if len % INDEX_SIZE != 0 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "invalid index file length",
-        ));
+fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u64, u64)> {
+    let index_file_len = index_file.metadata()?.len() as usize;
+    if index_file_len % INDEX_SIZE != 0 {
+        return error("invalid last index file size");
     }
 
-    let mut count = (len / INDEX_SIZE - 1) as u64 * INDEX_INTERVAL;
+    // read the last index, if any
+    let mut count = 0;
+    let mut offset = 0;
+    if index_file_len != 0 {
+        // read the index, get the offset
+        let mut index_buf = [0; INDEX_SIZE];
+        index_file.seek(SeekFrom::End(-(INDEX_SIZE as i64)))?;
+        index_file.read_exact(&mut index_buf)?;
+        offset = read_index(&index_buf);
 
-    let (offset, _) = read_index(index_file, len / INDEX_SIZE - 1)?;
-    data_file.seek(SeekFrom::Start(offset))?;
+        // seek the data file to the offset
+        data_file.seek(SeekFrom::Start(offset))?;
 
-    let mut buf = Vec::new();
-    data_file.read_to_end(&mut buf)?;
+        count = (index_file_len / INDEX_SIZE) as u64 * INDEX_INTERVAL;
+    }
+    dbg!(count);
 
-    // TODO check index 's complete
+    // read data
+    let mut data_buf = Vec::new();
+    data_file.read_to_end(&mut data_buf)?;
 
-    // parse entries
-    let mut hasher = Hasher::new();
-    let mut entry = &buf[..];
+    // walk entries to the end
+    let mut entry = &data_buf[..];
     while let Some(len) = parse_entry_len(entry) {
-        hasher.update(&entry[..LEN_SIZE + len]);
-        entry = &entry[LEN_SIZE + len..];
-        count += 1;
-    }
+        entry = &entry[HEADER_SIZE + len..];
 
-    Ok((count, hasher))
+        count += 1;
+
+        offset += (HEADER_SIZE + len) as u64;
+        if count % INDEX_INTERVAL == 0 {
+            append_index(index_file, offset)?;
+        }
+    }
+    dbg!(count);
+
+    Ok((count, offset))
+}
+
+fn append_index(file: &mut File, offset: u64) -> Result<()> {
+    file.write_all(&offset.to_ne_bytes())
 }
 
 // build data file name
@@ -784,19 +771,17 @@ fn index_file_name(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{:020}{}", seq, INDEX_SUFFIX))
 }
 
-fn new_index_file(dir: &Path, seq: u64) -> Result<File> {
-    let mut file = File::create(index_file_name(dir, seq))?;
-    file.write_all(&FIRST_INDEX)?;
-    Ok(file)
-}
-
 fn parse_entry_len(buf: &[u8]) -> Option<usize> {
-    if buf.len() < LEN_SIZE {
+    if buf.len() < HEADER_SIZE {
         return None;
     }
     let len = u16::from_ne_bytes(buf[0..LEN_SIZE].try_into().unwrap()) as usize;
-    if buf.len() < LEN_SIZE + len {
+    if buf.len() < HEADER_SIZE + len {
         return None;
     }
     Some(len)
+}
+
+fn error<T>(detail: impl Into<String>) -> Result<T> {
+    Err(Error::new(ErrorKind::InvalidData, detail.into()))
 }
