@@ -12,3 +12,4 @@ categories = ["database-implementations"]
 
 [dependencies]
 crc32fast = "1.5"
+thiserror = "2.0"

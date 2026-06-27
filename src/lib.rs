@@ -2,10 +2,16 @@
 
 use crc32fast::hash;
 use std::fs::{self, File};
-use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
+use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+mod error;
+
+use error::Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 const DATA_SUFFIX: &'static str = ".data";
 const INDEX_SUFFIX: &'static str = ".index";
@@ -101,7 +107,7 @@ impl SeqLog {
 
         // at least one data file
         let Some(file_seq) = file_seqs.last() else {
-            return error("no data file");
+            return Err(Error::NoDataFile);
         };
 
         let file_seq = **file_seq; // deref "&Arc<u64>" to u64
@@ -112,7 +118,8 @@ impl SeqLog {
         let fname = index_file_name(dir, file_seq);
         let mut current_index = File::options().append(true).read(true).open(fname)?;
 
-        let (count, file_size) = check_current_file(&mut current_data, &mut current_index)?;
+        let (count, file_size) =
+            check_current_file(&mut current_data, &mut current_index, file_seq)?;
 
         let next_seq = file_seq + count;
         let data_file_size = file_size as usize;
@@ -142,8 +149,6 @@ impl SeqLog {
 
     /// Append a batch of entries.
     ///
-    /// Return `ErrorKind::InvalidData` if any entry is longer than 65535.
-    ///
     /// This issues one `write(2)` syscall. Therefore, appending in batches
     /// reduces the number of system calls.
     ///
@@ -172,7 +177,7 @@ impl SeqLog {
             let len = entry.len();
 
             if len > ENTRY_MAX_LEN {
-                return Err(Error::new(ErrorKind::InvalidData, "too long entry"));
+                return Err(Error::EntryTooLarge(len as usize));
             }
 
             // encode the header: length + checksum
@@ -204,12 +209,12 @@ impl SeqLog {
         // finally, write into file
         let writen_len = self.current_data.write_vectored(&bufs)?;
         if writen_len == 0 {
-            return Err(Error::from(ErrorKind::WriteZero));
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
         }
         if writen_len < total_len {
             // truncate the new data
             self.current_data.set_len(self.data_file_size as u64)?;
-            return Err(Error::new(ErrorKind::WriteZero, "write paritial"));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "partitial").into());
         }
 
         // update status
@@ -264,7 +269,7 @@ impl SeqLog {
             // we have to keep one file at least, so return error if
             // it would remove all files
             let Some(i) = file_seqs.iter().rposition(|f| **f <= seq) else {
-                return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+                return Err(Error::SeqPurged(seq, *file_seqs[0]));
             };
 
             // remove some files
@@ -474,7 +479,8 @@ impl SeqLogReader {
             None => {
                 // or read more data
                 self.read_more_data()?;
-                parse_entry_len(&self.data_buf).ok_or(Error::from(ErrorKind::InvalidData))?
+                parse_entry_len(&self.data_buf)
+                    .ok_or(Error::DataFileTruncated(*self.file_seq, self.next_seq))?
             }
         };
 
@@ -485,7 +491,7 @@ impl SeqLogReader {
         let chsum1 = parse_checksum(&entry[LEN_SIZE..]);
         let chsum2 = hash(&payload) as u16;
         if chsum1 != chsum2 {
-            return error("invalid checksum");
+            return Err(Error::DataFileTruncated(*self.file_seq, self.next_seq));
         }
 
         self.next_seq += 1;
@@ -507,12 +513,12 @@ impl SeqLogReader {
             // end of current file, open new file
 
             if remain_len != 0 {
-                return error("invalid file end");
+                return Err(Error::DataFileTruncated(*self.file_seq, self.next_seq));
             }
 
             let file_seqs = self.state.file_seqs.read().unwrap();
             let Some(file_seq) = file_seqs.iter().rev().find(|&f| **f == self.next_seq) else {
-                return error("invalid new file");
+                return Err(Error::DataFileNotFound(self.next_seq));
             };
 
             self.file_seq = file_seq.clone();
@@ -520,7 +526,7 @@ impl SeqLogReader {
 
             len = self.current.read(&mut self.data_buf)?;
             if len == 0 {
-                return error("invalid file end 2");
+                return Err(Error::DataFileTruncated(self.next_seq, self.next_seq));
             }
         }
 
@@ -599,13 +605,13 @@ impl SharedState {
             self.next_seq()
         };
         if seq > max_seq {
-            return Err(Error::new(ErrorKind::NotFound, "seq is too new"));
+            return Err(Error::SeqNotReached(seq, max_seq));
         }
 
         // locate the file
         let file_seqs = self.file_seqs.read().unwrap();
         let Some(file_seq) = file_seqs.iter().rev().find(|&f| **f <= seq) else {
-            return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+            return Err(Error::SeqPurged(seq, *file_seqs[0]));
         };
 
         // lock the file, so the rotate() will not remove this
@@ -655,10 +661,11 @@ fn seek_seq_in_file(
     }
 
     // read data file
+    // TODO optimize, clear the code
     data_buf.resize(READBUF_SIZE, 0);
     let len = data_file.read(data_buf)?;
     if len == 0 {
-        return error("seq not found 1");
+        return Err(Error::DataFileTruncated(file_seq, seq));
     }
     data_buf.truncate(len);
 
@@ -679,14 +686,14 @@ fn seek_seq_in_file(
         }
 
         if data_buf.len() < READBUF_SIZE {
-            return error("seq not found 2");
+            return Err(Error::DataFileTruncated(file_seq, seq));
         }
 
         data_buf.copy_within(data_pos.., 0);
 
         let len = data_file.read(&mut data_buf[READBUF_SIZE - data_pos..])?;
         if len == 0 {
-            return error("seq not found 3");
+            return Err(Error::DataFileTruncated(file_seq, seq));
         }
         data_buf.truncate(READBUF_SIZE - data_pos + len);
     }
@@ -707,7 +714,7 @@ fn list_files(dir: &Path) -> Result<Vec<Arc<u64>>> {
             continue;
         }
         let Ok(seq) = fname[..fname.len() - DATA_SUFFIX.len()].parse() else {
-            return Err(Error::from(ErrorKind::InvalidFilename));
+            return Err(Error::InvalidDataFilename(fname.to_string()));
         };
 
         files.push(Arc::new(seq));
@@ -718,10 +725,14 @@ fn list_files(dir: &Path) -> Result<Vec<Arc<u64>>> {
     Ok(files)
 }
 
-fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u64, u64)> {
+fn check_current_file(
+    data_file: &mut File,
+    index_file: &mut File,
+    file_seq: u64,
+) -> Result<(u64, u64)> {
     let index_file_len = index_file.metadata()?.len() as usize;
     if index_file_len % INDEX_SIZE != 0 {
-        return error("invalid last index file size");
+        return Err(Error::InvalidIndexFile(file_seq));
     }
 
     // read the last index, if any
@@ -762,7 +773,7 @@ fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u6
 
 // append index to index file
 fn append_index(file: &mut File, offset: u64) -> Result<()> {
-    file.write_all(&offset.to_ne_bytes())
+    Ok(file.write_all(&offset.to_ne_bytes())?)
 }
 
 // build data file name
@@ -793,8 +804,4 @@ fn parse_checksum(buf: &[u8]) -> u16 {
 
 fn parse_index(buf: &[u8]) -> u64 {
     u64::from_ne_bytes(buf[..8].try_into().unwrap())
-}
-
-fn error<T>(detail: impl Into<String>) -> Result<T> {
-    Err(Error::new(ErrorKind::InvalidData, detail.into()))
 }
