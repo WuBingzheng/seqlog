@@ -253,13 +253,17 @@ impl SeqLog {
     ///
     /// This does not check if any reader are reading these entries.
     pub fn truncate(&mut self, seq: u64) -> Result<()> {
+        if seq >= self.next_seq() {
+            return Ok(());
+        }
+
         // is the seq in current file?
         if seq < self.file_seq {
-            let file_seqs = self.state.file_seqs.write().unwrap();
+            let mut file_seqs = self.state.file_seqs.write().unwrap();
 
             // we have to keep one file at least, so return error if
             // it would remove all files
-            let Some(i) = file_seqs.iter().rposition(|&f| *f <= seq) else {
+            let Some(i) = file_seqs.iter().rposition(|f| **f <= seq) else {
                 return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
             };
 
@@ -288,14 +292,18 @@ impl SeqLog {
             *self.state.current_dup.lock().unwrap() = Some(self.current_data.try_clone()?);
         }
 
-        // remove entries in current file
+        // remove entries in current data file
         let mut data_buf = Vec::new();
-        let (_, data_pos) = seek_seq_in_file(&self.state.dir, self.file_seq, seq, &mut data_buf)?;
-        self.data_file_size = 0;
-        self.current_data.set_len(data_file_len)?;
-        self.current_index.set_len(index_file_len)?;
-        self.current_data.seek(data_file_len)?;
-        self.current_index.seek(index_file_len)?;
+        let (mut file, data_pos) =
+            seek_seq_in_file(&self.state.dir, self.file_seq, seq, &mut data_buf)?;
+        self.data_file_size = file.stream_position()? as usize - (data_buf.len() - data_pos);
+        self.current_data.set_len(self.data_file_size as u64)?;
+        self.current_data.seek(SeekFrom::End(0))?;
+
+        // remove indexes in current index file
+        let index_file_size = (seq - self.file_seq) / INDEX_INTERVAL * INDEX_SIZE as u64;
+        self.current_index.set_len(index_file_size)?;
+        self.current_index.seek(SeekFrom::End(0))?;
 
         Ok(())
     }
