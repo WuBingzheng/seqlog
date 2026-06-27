@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 mod error;
 
-use error::Error;
+pub use error::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -491,7 +491,7 @@ impl SeqLogReader {
         let chsum1 = parse_checksum(&entry[LEN_SIZE..]);
         let chsum2 = hash(&payload) as u16;
         if chsum1 != chsum2 {
-            return Err(Error::DataFileTruncated(*self.file_seq, self.next_seq));
+            return Err(Error::ChecksumMismatch(*self.file_seq, self.next_seq));
         }
 
         self.next_seq += 1;
@@ -518,7 +518,7 @@ impl SeqLogReader {
 
             let file_seqs = self.state.file_seqs.read().unwrap();
             let Some(file_seq) = file_seqs.iter().rev().find(|&f| **f == self.next_seq) else {
-                return Err(Error::DataFileNotFound(self.next_seq));
+                return Err(Error::DataFileTruncated(self.next_seq, self.next_seq));
             };
 
             self.file_seq = file_seq.clone();
@@ -526,7 +526,7 @@ impl SeqLogReader {
 
             len = self.current.read(&mut self.data_buf)?;
             if len == 0 {
-                return Err(Error::DataFileTruncated(self.next_seq, self.next_seq));
+                return Err(Error::DataFileTruncated(*self.file_seq, self.next_seq));
             }
         }
 
