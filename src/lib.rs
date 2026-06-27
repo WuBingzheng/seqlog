@@ -350,7 +350,8 @@ impl SeqLog {
     pub fn reader(&self, next_seq: u64, synced_only: bool) -> Result<SeqLogReader> {
         let mut data_buf = Vec::new();
 
-        let (current, file_seq, data_pos) = self.state.seek_seq(next_seq, &mut data_buf)?;
+        let (current, file_seq, data_pos) =
+            self.state.seek_seq(next_seq, &mut data_buf, synced_only)?;
 
         Ok(SeqLogReader {
             state: self.state.clone(),
@@ -539,7 +540,9 @@ impl SeqLogReader {
     /// This is equvalent to [`SeqLog::reader`] to create a new reader.
     /// This is useful only if you can not access the SeqLog instance.
     pub fn reset(&mut self, seq: u64) -> Result<()> {
-        let (file, file_seq, data_pos) = self.state.seek_seq(seq, &mut self.data_buf)?;
+        let (file, file_seq, data_pos) =
+            self.state
+                .seek_seq(seq, &mut self.data_buf, self.synced_only)?;
 
         // update
         self.data_pos = data_pos;
@@ -584,8 +587,18 @@ impl SeqLogSyncer {
 }
 
 impl SharedState {
-    fn seek_seq(&self, seq: u64, data_buf: &mut Vec<u8>) -> Result<(File, Arc<u64>, usize)> {
-        if seq > self.next_seq() {
+    fn seek_seq(
+        &self,
+        seq: u64,
+        data_buf: &mut Vec<u8>,
+        synced_only: bool,
+    ) -> Result<(File, Arc<u64>, usize)> {
+        let max_seq = if synced_only {
+            self.sync_seq()
+        } else {
+            self.next_seq()
+        };
+        if seq > max_seq {
             return Err(Error::new(ErrorKind::NotFound, "seq is too new"));
         }
 
