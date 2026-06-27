@@ -16,8 +16,9 @@ const INDEX_INTERVAL: u64 = 1024;
 const READBUF_SIZE: usize = 128 * 1024; // bigger that ENTRY_MAX_LEN
 
 const LEN_SIZE: usize = std::mem::size_of::<u16>();
-const CHSUM_SIZE: usize = 2;
+const CHSUM_SIZE: usize = 2; // use 2 bytes of CRC32
 const HEADER_SIZE: usize = LEN_SIZE + CHSUM_SIZE;
+
 const INDEX_SIZE: usize = std::mem::size_of::<u64>();
 
 const ENTRY_MAX_LEN: usize = u16::MAX as usize;
@@ -36,15 +37,13 @@ struct SharedState {
     current_dup: Mutex<Option<File>>,
 
     // Syncer updates this after syncing.
-    synced_seq: AtomicU64,
+    sync_seq: AtomicU64,
 
     // Writer updates this after appending.
     next_seq: AtomicU64,
 }
 
-/// SeqLog instance.
-///
-/// This is also the Writer.
+/// SeqLog instance. It is also the Writer.
 pub struct SeqLog {
     _lock: File,
 
@@ -64,17 +63,25 @@ pub struct SeqLog {
 impl SeqLog {
     /// Create a SeqLog instance with start sequence number, and open it.
     ///
-    /// This mainly creates a directory using [`std::fs::create_dir`],
-    /// which requires that the parent directory of the given path already
-    /// exists and the path itself does not exist. It's equvalent to `mkdir`
-    /// without `-p`.
+    /// This requires that the parent directory of the given path already
+    /// exists and the path itself does not exist.
+    ///
+    /// This method creates the directory and some required files. If you
+    /// want to create it out of your program, use this script:
+    ///
+    /// ```bash
+    /// mkdir $path
+    /// touch $path/LOCK
+    /// touch $path/`printf "%020d.data" $start_seq`   # first data file
+    /// touch $path/`printf "%020d.index" $start_seq`  # first index file
+    /// ```
     pub fn create<P: AsRef<Path>>(path: P, start_seq: u64) -> Result<Self> {
         let dir = path.as_ref();
 
         fs::create_dir(dir)?;
 
-        // LOCK file holds the start_seq, for nothing
-        fs::write(dir.join(LOCK_FILE), start_seq.to_string())?;
+        // LOCK file
+        File::create(dir.join(LOCK_FILE))?;
 
         // first empty data file and index file
         File::create(data_file_name(dir, start_seq))?;
@@ -90,11 +97,11 @@ impl SeqLog {
         let lock = File::open(dir.join(LOCK_FILE))?;
         lock.try_lock()?;
 
-        let file_seqs = list_data_files(dir)?;
+        let file_seqs = list_files(dir)?;
 
         // at least one data file
         let Some(file_seq) = file_seqs.last() else {
-            return Err(Error::new(ErrorKind::InvalidData, "no data file"));
+            return error("no data file");
         };
 
         let file_seq = **file_seq; // deref "&Arc<u64>" to u64
@@ -115,7 +122,7 @@ impl SeqLog {
             dir: dir.to_path_buf(),
             file_seqs: RwLock::new(file_seqs),
             current_dup: Mutex::new(None),
-            synced_seq: AtomicU64::new(next_seq),
+            sync_seq: AtomicU64::new(next_seq),
             next_seq: AtomicU64::new(next_seq),
         };
 
@@ -124,7 +131,7 @@ impl SeqLog {
             state: Arc::new(state),
 
             rotate_size: 1024 * 1024 * 1024, // default value: 1G
-            rotate_count: 20,                // default value: 20
+            rotate_count: 10,                // default value: 10
 
             current_data,
             current_index,
@@ -149,7 +156,7 @@ impl SeqLog {
         // check rotation
         //
         // We must rotate at the beginning of function, but not at the tail.
-        // So uses can always sync() this file after the function.
+        // So uses can always sync() the current file after the function.
         if self.data_file_size >= self.rotate_size {
             self.rotate()?;
         }
@@ -176,12 +183,13 @@ impl SeqLog {
 
             bufs.push(IoSlice::new(&[])); // hold the place
 
-            // encode the payload
+            // the payload
             bufs.push(IoSlice::new(entry));
 
             total_len += HEADER_SIZE + len;
-
             next_seq += 1;
+
+            // append index
             if (next_seq - self.file_seq) % INDEX_INTERVAL == 0 {
                 let offset = self.data_file_size + total_len;
                 append_index(&mut self.current_index, offset as u64)?;
@@ -211,18 +219,20 @@ impl SeqLog {
         Ok(())
     }
 
-    /// Remove files that contain only entries before the sequence number.
+    /// Remove files containing only entries before the sequence number.
     ///
     /// If a data file contains entries both before and after the sequence
     /// number, it will not be removed.
     ///
     /// If a data file is in read by any reader, it will not be removed.
-    pub fn purge(&mut self, before_seq: u64) -> Result<()> {
+    ///
+    /// The current file is never removed.
+    pub fn purge(&mut self, seq: u64) -> Result<()> {
         let mut file_seqs = self.state.file_seqs.write().unwrap();
 
         let mut until = file_seqs.len() - 1;
         for (i, file_seq) in file_seqs.iter().enumerate() {
-            if **file_seq > before_seq {
+            if **file_seq > seq {
                 until = i.saturating_sub(1);
                 break;
             }
@@ -239,66 +249,85 @@ impl SeqLog {
         Ok(())
     }
 
-    /// Truncate entries exactly after the sequence number.
+    /// Truncate entries from the sequence number, inclusive.
     ///
-    /// This does not check if any reader are reading these entries. TODO
-    pub fn truncate(&mut self, _after_seq: u64) -> Result<()> {
-        // if after_seq >= self.next_seq() {
-        //     return Ok(());
-        // }
+    /// This does not check if any reader are reading these entries.
+    pub fn truncate(&mut self, seq: u64) -> Result<()> {
+        // is the seq in current file?
+        if seq < self.file_seq {
+            let file_seqs = self.state.file_seqs.write().unwrap();
 
-        // let current_start_seq = read_block_seq(&mut self.current, 0)?;
+            // we have to keep one file at least, so return error if
+            // it would remove all files
+            let Some(i) = file_seqs.iter().rposition(|&f| *f <= seq) else {
+                return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+            };
 
-        // // after_seq is in current file
-        // if current_start_seq <= after_seq {
-        //     // locate block in file
-        //     let (block_index, block_seq) =
-        //         locate_block(&mut self.current, current_start_seq, after_seq)?;
+            // remove some files
+            for file_seq in file_seqs.drain(i + 1..) {
+                fs::remove_file(data_file_name(&self.state.dir, *file_seq))?;
+                fs::remove_file(index_file_name(&self.state.dir, *file_seq))?;
+            }
 
-        //     // locate entry in block
-        //     let mut block_buf = Vec::new();
-        //     let block_pos = locate_entry(
-        //         &mut self.current,
-        //         &mut block_buf,
-        //         block_index,
-        //         block_seq,
-        //         after_seq,
-        //     )?;
+            let file_seq = *file_seqs[i];
 
-        //     self.file_size = block_index * BLOCK_SIZE + block_pos;
-        //     self.current.set_len(self.file_size as u64)?;
+            // open new data file and index file
+            let fname = data_file_name(&self.state.dir, file_seq);
+            self.current_data = File::options().append(true).read(true).open(fname)?;
 
-        //     self.state.next_seq.store(after_seq, Ordering::Relaxed);
-        //     self.state.synced_seq.store(after_seq, Ordering::Relaxed);
+            let fname = index_file_name(&self.state.dir, file_seq);
+            self.current_index = File::options().append(true).read(true).open(fname)?;
 
-        // // after_seq is in older files
-        // } else {
-        //     todo!();
-        // }
+            self.data_file_size = 0; // reset later
+            self.file_seq = file_seq;
+
+            // update shared state
+            self.state.next_seq.store(seq, Ordering::Relaxed);
+            self.state.sync_seq.store(seq, Ordering::Relaxed);
+
+            *self.state.current_dup.lock().unwrap() = Some(self.current_data.try_clone()?);
+        }
+
+        // remove entries in current file
+        let mut data_buf = Vec::new();
+        let (_, data_pos) = seek_seq_in_file(&self.state.dir, self.file_seq, seq, &mut data_buf)?;
+        self.data_file_size = 0;
+        self.current_data.set_len(data_file_len)?;
+        self.current_index.set_len(index_file_len)?;
+        self.current_data.seek(data_file_len)?;
+        self.current_index.seek(index_file_len)?;
 
         Ok(())
     }
 
     /// Return the next sequence number.
     pub fn next_seq(&self) -> u64 {
-        self.state.next_seq.load(Ordering::Relaxed)
+        self.state.next_seq()
     }
 
-    pub fn synced_seq(&self) -> u64 {
-        self.state.synced_seq.load(Ordering::Relaxed)
+    /// Return the next sequence number to synchronize to disk.
+    ///
+    /// This is the synchronization version of [`Self::next_seq`].
+    pub fn sync_seq(&self) -> u64 {
+        self.state.sync_seq()
     }
 
-    /// Synchronize new data onto disk.
+    /// Synchronizes entries to disk.
+    ///
+    /// Syncing data to disk is a relatively slow and blocking operation.
+    /// If you do not want to block the current thread, create a
+    /// [`SeqLogSyncer`] via [`Self::syncer`] and send it to another thread
+    /// to perform synchronization there.
     pub fn sync(&self) -> Result<()> {
-        let seq = self.state.next_seq.load(Ordering::Acquire);
+        let seq = self.next_seq();
 
         self.current_data.sync_data()?;
 
-        self.state.synced_seq.store(seq, Ordering::Release);
+        self.state.sync_seq.store(seq, Ordering::Release);
         Ok(())
     }
 
-    /// Create a Syncer.
+    /// Create a [`SeqLogSyncer`].
     pub fn syncer(&self) -> Result<SeqLogSyncer> {
         Ok(SeqLogSyncer {
             state: self.state.clone(),
@@ -307,6 +336,9 @@ impl SeqLog {
     }
 
     /// Create a new [`SeqLogReader`] with the sequence number.
+    ///
+    /// If `synced_only` is set to `true`, the reader will only read entries
+    /// that have been synchronized to disk via [`Self::sync`] or [`SeqLogSyncer::sync`].
     pub fn reader(&self, next_seq: u64, synced_only: bool) -> Result<SeqLogReader> {
         let mut data_buf = Vec::new();
 
@@ -331,7 +363,7 @@ impl SeqLog {
     /// is 1G. Setting to 0 means never rotating, and you can call [`Self::rotate`]
     /// to rotate manaully.
     ///
-    /// `count`: Number of files to retain. The default value is 20. Setting to
+    /// `count`: Number of files to retain. The default value is 10. Setting to
     /// 0 means keeping all files, and you can call [`Self::purge`] to delete
     /// manually.
     pub fn set_rotate(&mut self, size: usize, count: usize) {
@@ -374,14 +406,14 @@ impl SeqLog {
             fs::remove_file(index_file_name(&self.state.dir, *file_seq))?;
         }
 
-        // tell syncer
+        // notify the syncer
         *self.state.current_dup.lock().unwrap() = Some(self.current_data.try_clone()?);
 
         Ok(())
     }
 }
 
-/// A sequential reader for scanning entries in a SeqLog.
+/// A sequential reader for scanning entries.
 ///
 /// Compared with key-value stores, SeqLog has two characteristics for reading:
 ///
@@ -417,15 +449,15 @@ impl SeqLogReader {
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
         // check if end
         let max_seq = if self.synced_only {
-            self.state.synced_seq.load(Ordering::Relaxed)
+            self.state.sync_seq()
         } else {
-            self.state.next_seq.load(Ordering::Relaxed)
+            self.state.next_seq()
         };
         if self.next_seq >= max_seq {
             return Ok(None);
         }
 
-        // so there must be an entry
+        // now there must be an entry
 
         // if any in the current buffer
         let len = match parse_entry_len(&self.data_buf[self.data_pos..]) {
@@ -496,8 +528,8 @@ impl SeqLogReader {
     /// Reset the sequence number. Then [`Self::next`] will return
     /// the entry with this sequence number later.
     ///
-    /// This is equvalent to [`SeqLog::reader`]. This is useful only
-    /// if you can not access the SeqLog instance.
+    /// This is equvalent to [`SeqLog::reader`] to create a new reader.
+    /// This is useful only if you can not access the SeqLog instance.
     pub fn reset(&mut self, seq: u64) -> Result<()> {
         let (file, file_seq, data_pos) = self.state.seek_seq(seq, &mut self.data_buf)?;
 
@@ -510,6 +542,12 @@ impl SeqLogReader {
     }
 }
 
+/// A cross-thread synchronizing handler.
+///
+/// Unlike [`SeqLog::sync`], a `SeqLogSyncer` can be sent to a different thread
+/// and used to perform synchronization there. This allows disk sync operations
+/// to be offloaded from the writer thread, avoiding stalls caused by slow and
+/// blocking storage operations.
 pub struct SeqLogSyncer {
     state: Arc<SharedState>,
 
@@ -517,27 +555,29 @@ pub struct SeqLogSyncer {
 }
 
 impl SeqLogSyncer {
+    /// Synchronize data to disk.
     pub fn sync(&mut self) -> Result<()> {
         // load next_seq before sync()
-        let mut next_seq = self.state.next_seq.load(Ordering::Acquire);
+        let mut next_seq = self.state.next_seq();
 
         self.current.sync_data()?;
 
+        // check new file rotated
         if let Some(new_file) = self.state.current_dup.lock().unwrap().take() {
-            next_seq = self.state.next_seq.load(Ordering::Acquire);
+            next_seq = self.state.next_seq();
             self.current = new_file;
             self.current.sync_data()?;
         }
 
-        // store synced_seq after sync()
-        self.state.synced_seq.store(next_seq, Ordering::Release);
+        // store sync_seq after sync()
+        self.state.sync_seq.store(next_seq, Ordering::Release);
         Ok(())
     }
 }
 
 impl SharedState {
     fn seek_seq(&self, seq: u64, data_buf: &mut Vec<u8>) -> Result<(File, Arc<u64>, usize)> {
-        if seq > self.next_seq.load(Ordering::Relaxed) {
+        if seq > self.next_seq() {
             return Err(Error::new(ErrorKind::NotFound, "seq is too new"));
         }
 
@@ -557,6 +597,14 @@ impl SharedState {
         let (file, data_pos) = seek_seq_in_file(&self.dir, *file_seq, seq, data_buf)?;
 
         Ok((file, file_seq, data_pos))
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::Acquire)
+    }
+
+    fn sync_seq(&self) -> u64 {
+        self.sync_seq.load(Ordering::Acquire)
     }
 }
 
@@ -598,6 +646,7 @@ fn seek_seq_in_file(
         return Ok((data_file, 0));
     }
 
+    // walk the entries
     loop {
         let mut data_pos = 0;
         while let Some(len) = parse_entry_len(&data_buf[data_pos..]) {
@@ -622,7 +671,8 @@ fn seek_seq_in_file(
     }
 }
 
-fn list_data_files(dir: &Path) -> Result<Vec<Arc<u64>>> {
+// list all files and return the seqs
+fn list_files(dir: &Path) -> Result<Vec<Arc<u64>>> {
     let mut files = Vec::new();
 
     for entry in fs::read_dir(dir)? {
@@ -689,6 +739,7 @@ fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u6
     Ok((count, offset))
 }
 
+// append index to index file
 fn append_index(file: &mut File, offset: u64) -> Result<()> {
     file.write_all(&offset.to_ne_bytes())
 }
@@ -703,6 +754,7 @@ fn index_file_name(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{:020}{}", seq, INDEX_SUFFIX))
 }
 
+// return None if not complete
 fn parse_entry_len(buf: &[u8]) -> Option<usize> {
     if buf.len() < HEADER_SIZE {
         return None;
