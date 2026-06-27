@@ -4,7 +4,7 @@ use crc32fast::hash;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const DATA_SUFFIX: &'static str = ".data";
@@ -22,21 +22,14 @@ const INDEX_SIZE: usize = std::mem::size_of::<u64>();
 
 const ENTRY_MAX_LEN: usize = u16::MAX as usize;
 
-struct DataFile {
-    // the file name, also the first entry seq in this file
-    seq: u64,
-
-    // by Readers
-    refers: AtomicUsize,
-}
-
 // The state that is shared amount Writer, Syncer, and multiple Readers.
 struct SharedState {
+    // read-only
     dir: PathBuf,
 
     // Writer updates this when rotating.
     // Readers use this to scan files.
-    data_files: RwLock<Vec<DataFile>>,
+    file_seqs: RwLock<Vec<Arc<u64>>>,
 
     // Writer inserts new file's clone into this when rotating.
     // Syncer takes this.
@@ -97,14 +90,14 @@ impl SeqLog {
         let lock = File::open(dir.join(LOCK_FILE))?;
         lock.try_lock()?;
 
-        let data_files = list_data_files(dir)?;
+        let file_seqs = list_data_files(dir)?;
 
         // at least one data file
-        let Some(current_data_file) = data_files.last() else {
+        let Some(file_seq) = file_seqs.last() else {
             return Err(Error::new(ErrorKind::InvalidData, "no data file"));
         };
 
-        let file_seq = current_data_file.seq;
+        let file_seq = **file_seq; // deref "&Arc<u64>" to u64
 
         let fname = data_file_name(dir, file_seq);
         let mut current_data = File::options().append(true).read(true).open(fname)?;
@@ -120,7 +113,7 @@ impl SeqLog {
 
         let state = SharedState {
             dir: dir.to_path_buf(),
-            data_files: RwLock::new(data_files),
+            file_seqs: RwLock::new(file_seqs),
             current_dup: Mutex::new(None),
             synced_seq: AtomicU64::new(next_seq),
             next_seq: AtomicU64::new(next_seq),
@@ -142,29 +135,27 @@ impl SeqLog {
 
     /// Append a batch of entries.
     ///
-    /// Return `ErrorKind::InvalidData` if any entry is empty (length=0) or
-    /// longer than 65526 (64K - 10).
+    /// Return `ErrorKind::InvalidData` if any entry is longer than 65535.
     ///
     /// This issues one `write(2)` syscall. Therefore, appending in batches
     /// reduces the number of system calls.
     ///
     /// This writes data into file (page cache), but does not synchronize
-    /// disk. You should call [`Self::sync`] if needed.
+    /// disk. Use [`Self::sync`] or [`SeqLogSyncer`] if needed.
     pub fn append<T>(&mut self, entries: &[T]) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
         // check rotation
         //
-        // We can not check and rotate at the tail of this function, because
-        // that may close the current file and user can not call sync() on it.
+        // We must rotate at the beginning of function, but not at the tail.
+        // So uses can always sync() this file after the function.
         if self.data_file_size >= self.rotate_size {
             self.rotate()?;
         }
 
-        let mut lengths = Vec::with_capacity(entries.len());
-        let mut chsums = Vec::with_capacity(entries.len());
-        let mut bufs = Vec::with_capacity(entries.len() * 2);
+        let mut headers = Vec::with_capacity(entries.len());
+        let mut bufs = Vec::with_capacity(entries.len() * 2); // header + payload
 
         let mut total_len = 0;
         let mut next_seq = self.next_seq();
@@ -177,10 +168,12 @@ impl SeqLog {
                 return Err(Error::new(ErrorKind::InvalidData, "too long entry"));
             }
 
-            // encode the length
-            lengths.push((len as u16).to_ne_bytes());
-            chsums.push((hash(entry) as u16).to_ne_bytes());
-            bufs.push(IoSlice::new(&[])); // hold the place
+            // encode the header: length + checksum
+            let mut header_buf = [0u8; HEADER_SIZE];
+            header_buf[..2].copy_from_slice(&(len as u16).to_ne_bytes());
+            header_buf[2..].copy_from_slice(&(hash(entry) as u16).to_ne_bytes());
+            headers.push(header_buf);
+
             bufs.push(IoSlice::new(&[])); // hold the place
 
             // encode the payload
@@ -196,9 +189,8 @@ impl SeqLog {
         }
 
         // fix headers in buf
-        for i in 0..entries.len() {
-            bufs[i * 3] = IoSlice::new(&lengths[i]);
-            bufs[i * 3 + 1] = IoSlice::new(&chsums[i]);
+        for (i, header) in headers.iter().enumerate() {
+            bufs[i * 2] = IoSlice::new(&header[..]);
         }
 
         // finally, write into file
@@ -226,23 +218,23 @@ impl SeqLog {
     ///
     /// If a data file is in read by any reader, it will not be removed.
     pub fn purge(&mut self, before_seq: u64) -> Result<()> {
-        let mut data_files = self.state.data_files.write().unwrap();
+        let mut file_seqs = self.state.file_seqs.write().unwrap();
 
-        let mut until = data_files.len() - 1;
-        for (i, data_file) in data_files.iter().enumerate() {
-            if data_file.seq > before_seq {
+        let mut until = file_seqs.len() - 1;
+        for (i, file_seq) in file_seqs.iter().enumerate() {
+            if **file_seq > before_seq {
                 until = i.saturating_sub(1);
                 break;
             }
-            if data_file.refers.load(Ordering::Relaxed) != 0 {
+            if Arc::strong_count(file_seq) > 1 {
                 until = i;
                 break;
             }
         }
 
-        for data_file in data_files.drain(..until) {
-            fs::remove_file(data_file_name(&self.state.dir, data_file.seq))?;
-            fs::remove_file(index_file_name(&self.state.dir, data_file.seq))?;
+        for file_seq in file_seqs.drain(..until) {
+            fs::remove_file(data_file_name(&self.state.dir, *file_seq))?;
+            fs::remove_file(index_file_name(&self.state.dir, *file_seq))?;
         }
         Ok(())
     }
@@ -298,10 +290,11 @@ impl SeqLog {
 
     /// Synchronize new data onto disk.
     pub fn sync(&self) -> Result<()> {
+        let seq = self.state.next_seq.load(Ordering::Acquire);
+
         self.current_data.sync_data()?;
-        self.state
-            .synced_seq
-            .store(self.next_seq(), Ordering::Relaxed);
+
+        self.state.synced_seq.store(seq, Ordering::Release);
         Ok(())
     }
 
@@ -314,19 +307,16 @@ impl SeqLog {
     }
 
     /// Create a new [`SeqLogReader`] with the sequence number.
-    pub fn reader(&self, next_seq: u64) -> Result<SeqLogReader> {
+    pub fn reader(&self, next_seq: u64, synced_only: bool) -> Result<SeqLogReader> {
         let mut data_buf = Vec::new();
 
-        let (current, file_seq, data_pos) = seek_seq(
-            &self.state.dir,
-            &self.state.data_files,
-            next_seq,
-            &mut data_buf,
-        )?;
+        let (current, file_seq, data_pos) = self.state.seek_seq(next_seq, &mut data_buf)?;
 
         Ok(SeqLogReader {
             state: self.state.clone(),
             data_buf,
+
+            synced_only,
 
             current,
             file_seq,
@@ -351,74 +341,44 @@ impl SeqLog {
 
     /// Rotate the data file manually, e.g. by time or sequence number.
     ///
-    /// Return the new file name, so you can handle it, such as make a symlink.
-    ///
     /// It does not rotate if the current file is empty.
     ///
     /// You should have called [`Self::set_rotate`] with `size=0` to disable
     /// the automatic rotation.
-    pub fn rotate(&mut self) -> Result<PathBuf> {
-        let next_seq = self.next_seq();
-
-        let data_fname = data_file_name(&self.state.dir, next_seq);
+    pub fn rotate(&mut self) -> Result<()> {
         if self.data_file_size == 0 {
             // do not rotate if current file is empty
-            return Ok(data_fname);
+            return Ok(());
         }
 
-        // open new file
-        self.current_data = File::create_new(&data_fname)?;
-        self.current_index = File::create_new(index_file_name(&self.state.dir, next_seq))?;
+        let next_seq = self.next_seq();
 
+        // open new file
+        self.current_data = File::create_new(data_file_name(&self.state.dir, next_seq))?;
+        self.current_index = File::create_new(index_file_name(&self.state.dir, next_seq))?;
         self.data_file_size = 0;
         self.file_seq = next_seq;
 
         // save new file info
-        let new_file = DataFile {
-            seq: next_seq,
-            refers: AtomicUsize::new(0),
-        };
-
-        let mut data_files = self.state.data_files.write().unwrap();
-        data_files.push(new_file);
+        let mut file_seqs = self.state.file_seqs.write().unwrap();
+        file_seqs.push(Arc::new(next_seq));
 
         // expire
-        while data_files.len() > self.rotate_count {
-            if data_files[0].refers.load(Ordering::Relaxed) > 0 {
+        while file_seqs.len() > self.rotate_count {
+            if Arc::strong_count(&file_seqs[0]) > 0 {
                 // this file is in used
                 break;
             }
-            let data_file = data_files.remove(0);
-            fs::remove_file(data_file_name(&self.state.dir, data_file.seq))?;
-            fs::remove_file(index_file_name(&self.state.dir, data_file.seq))?;
+            let file_seq = file_seqs.remove(0);
+            fs::remove_file(data_file_name(&self.state.dir, *file_seq))?;
+            fs::remove_file(index_file_name(&self.state.dir, *file_seq))?;
         }
 
         // tell syncer
         *self.state.current_dup.lock().unwrap() = Some(self.current_data.try_clone()?);
 
-        Ok(data_fname)
-    }
-
-    /// Remove all data and start at the new sequence number.
-    ///
-    /// This renames the directory to `backup_dir`, creates a new SeqLog instance,
-    /// and replaces `self` with the new instance.
-    ///
-    /// All entries in SeqLog must have contiguous sequence numbers. When you
-    /// need to skip some sequence numbers (e.g., after loading a new snapshot),
-    /// the only way is to clean up the old data and create a new SeqLog
-    /// instance starting from the new sequence number using this method.
-    pub fn reset<P: AsRef<Path>>(&mut self, next_seq: u64, backup_dir: P) -> Result<()> {
-        fs::rename(&self.state.dir, backup_dir)?;
-
-        *self = Self::create(&self.state.dir, next_seq)?;
-
         Ok(())
     }
-}
-
-fn read_index(buf: &[u8]) -> u64 {
-    u64::from_ne_bytes(buf[..8].try_into().unwrap())
 }
 
 /// A sequential reader for scanning entries in a SeqLog.
@@ -443,8 +403,10 @@ fn read_index(buf: &[u8]) -> u64 {
 pub struct SeqLogReader {
     state: Arc<SharedState>,
 
+    synced_only: bool,
+
     current: File,
-    file_seq: u64,
+    file_seq: Arc<u64>,
     data_buf: Vec<u8>,
     data_pos: usize,
     next_seq: u64,
@@ -453,36 +415,77 @@ pub struct SeqLogReader {
 impl SeqLogReader {
     /// Return the next entry.
     pub fn next(&mut self) -> Result<Option<&[u8]>> {
-        // check any entry in current data buffer
-        if let Some(len) = parse_entry_len(&self.data_buf[self.data_pos..]) {
-            // yes, happy path
-            let entry = &self.data_buf[self.data_pos..];
-            let payload = &entry[HEADER_SIZE..HEADER_SIZE + len];
-
-            // check checksum
-            let chsum1 = parse_checksum(&entry[LEN_SIZE..]);
-            let chsum2 = hash(&payload) as u16;
-            if chsum1 != chsum2 {
-                return error("invalid checksum");
-            }
-
-            self.next_seq += 1;
-            self.data_pos += HEADER_SIZE + len;
-            return Ok(Some(payload));
+        // check if end
+        let max_seq = if self.synced_only {
+            self.state.synced_seq.load(Ordering::Relaxed)
+        } else {
+            self.state.next_seq.load(Ordering::Relaxed)
+        };
+        if self.next_seq >= max_seq {
+            return Ok(None);
         }
 
-        // read more from data file
+        // so there must be an entry
+
+        // if any in the current buffer
+        let len = match parse_entry_len(&self.data_buf[self.data_pos..]) {
+            Some(len) => len,
+            None => {
+                // or read more data
+                self.read_more_data()?;
+                parse_entry_len(&self.data_buf).ok_or(Error::from(ErrorKind::InvalidData))?
+            }
+        };
+
+        let entry = &self.data_buf[self.data_pos..];
+        let payload = &entry[HEADER_SIZE..HEADER_SIZE + len];
+
+        // check checksum
+        let chsum1 = parse_checksum(&entry[LEN_SIZE..]);
+        let chsum2 = hash(&payload) as u16;
+        if chsum1 != chsum2 {
+            return error("invalid checksum");
+        }
+
+        self.next_seq += 1;
+        self.data_pos += HEADER_SIZE + len;
+        return Ok(Some(payload));
+    }
+
+    // We have checked the seq, so there must be one entry at least.
+    // Return Error if can not read more data.
+    fn read_more_data(&mut self) -> Result<()> {
         let remain_len = self.data_buf.len() - self.data_pos;
         self.data_buf.copy_within(self.data_pos.., 0);
 
-        let len = self.current.read(&mut self.data_buf[remain_len..])?;
+        self.data_buf.resize(READBUF_SIZE, 0);
+
+        let mut len = self.current.read(&mut self.data_buf[remain_len..])?;
+
         if len == 0 {
-            return Ok(None);
+            // end of current file, open new file
+
+            if remain_len != 0 {
+                return error("invalid file end");
+            }
+
+            let file_seqs = self.state.file_seqs.read().unwrap();
+            let Some(file_seq) = file_seqs.iter().rev().find(|&f| **f == self.next_seq) else {
+                return error("invalid new file");
+            };
+
+            self.file_seq = file_seq.clone();
+            self.current = File::open(data_file_name(&self.state.dir, **file_seq))?;
+
+            len = self.current.read(&mut self.data_buf)?;
+            if len == 0 {
+                return error("invalid file end 2");
+            }
         }
+
         self.data_buf.truncate(remain_len + len);
         self.data_pos = 0;
-
-        self.next() // TODO
+        Ok(())
     }
 
     /// Return the next sequence number.
@@ -493,23 +496,10 @@ impl SeqLogReader {
     /// Reset the sequence number. Then [`Self::next`] will return
     /// the entry with this sequence number later.
     ///
-    /// This also resets the entire SeqLogReader instance.
-    ///
-    /// This is expensive and you should not call this often.
+    /// This is equvalent to [`SeqLog::reader`]. This is useful only
+    /// if you can not access the SeqLog instance.
     pub fn reset(&mut self, seq: u64) -> Result<()> {
-        let (file, file_seq, data_pos) = seek_seq(
-            &self.state.dir,
-            &self.state.data_files,
-            seq,
-            &mut self.data_buf,
-        )?;
-
-        // unlock original file
-        let data_files = self.state.data_files.read().unwrap();
-        let i = data_files
-            .binary_search_by_key(&self.file_seq, |f| f.seq)
-            .unwrap();
-        data_files[i].refers.fetch_sub(1, Ordering::Relaxed); // unlock the file
+        let (file, file_seq, data_pos) = self.state.seek_seq(seq, &mut self.data_buf)?;
 
         // update
         self.data_pos = data_pos;
@@ -545,28 +535,29 @@ impl SeqLogSyncer {
     }
 }
 
-// seek the sequence number in all data files
-fn seek_seq(
-    dir: &Path,
-    arc_data_files: &RwLock<Vec<DataFile>>,
-    seq: u64,
-    data_buf: &mut Vec<u8>,
-) -> Result<(File, u64, usize)> {
-    // if seq > self.main.next_seq {
-    //     return Ok(false);
-    // }
+impl SharedState {
+    fn seek_seq(&self, seq: u64, data_buf: &mut Vec<u8>) -> Result<(File, Arc<u64>, usize)> {
+        if seq > self.next_seq.load(Ordering::Relaxed) {
+            return Err(Error::new(ErrorKind::NotFound, "seq is too new"));
+        }
 
-    // locate the file
-    let data_files = arc_data_files.read().unwrap();
-    let Some(data_file) = data_files.iter().rev().find(|&f| f.seq <= seq) else {
-        return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
-    };
+        // locate the file
+        let file_seqs = self.file_seqs.read().unwrap();
+        let Some(file_seq) = file_seqs.iter().rev().find(|&f| **f <= seq) else {
+            return Err(Error::new(ErrorKind::NotFound, "seq is expired"));
+        };
 
-    let (file, data_pos) = seek_seq_in_file(dir, data_file.seq, seq, data_buf)?;
+        // lock the file, so the rotate() will not remove this
+        let file_seq = file_seq.clone();
 
-    data_file.refers.fetch_add(1, Ordering::Relaxed); // lock the file
+        // unlock ASAP
+        drop(file_seqs);
 
-    Ok((file, data_file.seq, data_pos))
+        // locate the entry in the file
+        let (file, data_pos) = seek_seq_in_file(&self.dir, *file_seq, seq, data_buf)?;
+
+        Ok((file, file_seq, data_pos))
+    }
 }
 
 fn seek_seq_in_file(
@@ -588,7 +579,7 @@ fn seek_seq_in_file(
         let mut index_buf = [0; INDEX_SIZE];
         index_file.read_exact(&mut index_buf)?;
 
-        let offset = read_index(&index_buf);
+        let offset = parse_index(&index_buf);
 
         // seek the data file to the offset
         data_file.seek(SeekFrom::Start(offset))?;
@@ -631,7 +622,7 @@ fn seek_seq_in_file(
     }
 }
 
-fn list_data_files(dir: &Path) -> Result<Vec<DataFile>> {
+fn list_data_files(dir: &Path) -> Result<Vec<Arc<u64>>> {
     let mut files = Vec::new();
 
     for entry in fs::read_dir(dir)? {
@@ -648,14 +639,10 @@ fn list_data_files(dir: &Path) -> Result<Vec<DataFile>> {
             return Err(Error::from(ErrorKind::InvalidFilename));
         };
 
-        files.push(DataFile {
-            seq,
-            refers: AtomicUsize::new(0),
-        });
+        files.push(Arc::new(seq));
     }
 
-    // sort by start_seq
-    files.sort_by_key(|f| f.seq);
+    files.sort();
 
     Ok(files)
 }
@@ -674,7 +661,7 @@ fn check_current_file(data_file: &mut File, index_file: &mut File) -> Result<(u6
         let mut index_buf = [0; INDEX_SIZE];
         index_file.seek(SeekFrom::End(-(INDEX_SIZE as i64)))?;
         index_file.read_exact(&mut index_buf)?;
-        offset = read_index(&index_buf);
+        offset = parse_index(&index_buf);
 
         // seek the data file to the offset
         data_file.seek(SeekFrom::Start(offset))?;
@@ -729,6 +716,10 @@ fn parse_entry_len(buf: &[u8]) -> Option<usize> {
 
 fn parse_checksum(buf: &[u8]) -> u16 {
     u16::from_ne_bytes(buf[0..CHSUM_SIZE].try_into().unwrap())
+}
+
+fn parse_index(buf: &[u8]) -> u64 {
+    u64::from_ne_bytes(buf[..8].try_into().unwrap())
 }
 
 fn error<T>(detail: impl Into<String>) -> Result<T> {
