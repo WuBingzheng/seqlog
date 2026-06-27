@@ -259,7 +259,7 @@ impl SeqLog {
     /// This does not check if any reader are reading these entries.
     pub fn truncate(&mut self, seq: u64) -> Result<()> {
         if seq >= self.next_seq() {
-            return Ok(());
+            return Err(Error::SeqNotReached(seq, self.next_seq()));
         }
 
         // is the seq in current file?
@@ -290,10 +290,6 @@ impl SeqLog {
             self.data_file_size = 0; // reset later
             self.file_seq = file_seq;
 
-            // update shared state
-            self.state.next_seq.store(seq, Ordering::Relaxed);
-            self.state.sync_seq.store(seq, Ordering::Relaxed);
-
             *self.state.current_dup.lock().unwrap() = Some(self.current_data.try_clone()?);
         }
 
@@ -309,6 +305,10 @@ impl SeqLog {
         let index_file_size = (seq - self.file_seq) / INDEX_INTERVAL * INDEX_SIZE as u64;
         self.current_index.set_len(index_file_size)?;
         self.current_index.seek(SeekFrom::End(0))?;
+
+        // update shared state
+        self.state.next_seq.store(seq, Ordering::Relaxed);
+        self.state.sync_seq.store(seq, Ordering::Relaxed);
 
         Ok(())
     }
