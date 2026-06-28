@@ -182,8 +182,8 @@ impl SeqLog {
 
             // encode the header: length + checksum
             let mut header_buf = [0u8; HEADER_SIZE];
-            header_buf[..2].copy_from_slice(&(len as u16).to_ne_bytes());
-            header_buf[2..].copy_from_slice(&(hash(entry) as u16).to_ne_bytes());
+            header_buf[..2].copy_from_slice(&(len as u16).to_le_bytes());
+            header_buf[2..].copy_from_slice(&(hash(entry) as u16).to_le_bytes());
             headers.push(header_buf);
 
             bufs.push(IoSlice::new(&[])); // hold the place
@@ -770,7 +770,7 @@ fn check_current_file(
 
 // append index to index file
 fn append_index(file: &mut File, offset: u64) -> Result<()> {
-    Ok(file.write_all(&offset.to_ne_bytes())?)
+    Ok(file.write_all(&offset.to_le_bytes())?)
 }
 
 // build data file name
@@ -788,7 +788,7 @@ fn parse_entry_len(buf: &[u8]) -> Option<usize> {
     if buf.len() < HEADER_SIZE {
         return None;
     }
-    let len = u16::from_ne_bytes(buf[0..LEN_SIZE].try_into().unwrap()) as usize;
+    let len = u16::from_le_bytes(buf[0..LEN_SIZE].try_into().unwrap()) as usize;
     if buf.len() < HEADER_SIZE + len {
         return None;
     }
@@ -796,9 +796,9 @@ fn parse_entry_len(buf: &[u8]) -> Option<usize> {
 }
 
 fn parse_checksum(buf: &[u8]) -> u16 {
-    u16::from_ne_bytes(buf[0..CHSUM_SIZE].try_into().unwrap())
+    u16::from_le_bytes(buf[0..CHSUM_SIZE].try_into().unwrap())
 }
 
 fn parse_index(buf: &[u8]) -> u64 {
-    u64::from_ne_bytes(buf[..8].try_into().unwrap())
+    u64::from_le_bytes(buf[..8].try_into().unwrap())
 }
