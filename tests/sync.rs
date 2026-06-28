@@ -1,16 +1,10 @@
-use seqlog::{Result, SeqLog};
+use seqlog::Result;
 
-fn open(dir: &str) -> Result<SeqLog> {
-    if !std::fs::exists(dir)? {
-        SeqLog::create(dir, 100)
-    } else {
-        SeqLog::open(dir)
-    }
-}
+mod common;
 
 #[test]
-fn test_sync() -> Result<()> {
-    let mut store = open("target/tests-store")?;
+fn sync() -> Result<()> {
+    let mut store = common::open("target/tests-sync")?;
 
     // on open
     let next_seq0 = store.next_seq();
@@ -20,32 +14,28 @@ fn test_sync() -> Result<()> {
     let mut reader1 = store.reader(next_seq0, false)?;
     let mut reader2 = store.reader(next_seq0, true)?;
 
-    // append new data
-    let entries = vec![
-        "hello, world!",
-        "111",
-        "222222",
-        "333333333",
-        "444444444444",
-        "555555555555555",
-        "666666666666666666",
-        "777777777777777777777",
-        "888888888888888888888888",
-        "999999999999999999999999999",
-    ];
-    store.append(&entries)?;
+    common::append10(&mut store)?;
 
     assert_eq!(store.next_seq(), next_seq0 + 10); // update
     assert_eq!(store.sync_seq(), sync_seq0); // no update
 
-    // reader
-    assert_eq!(reader1.next()?, Some(entries[0].as_bytes()));
+    // reader-1
+    let mut entry_data = common::ENTRIES.iter();
+    while let Some(entry) = reader1.next()? {
+        assert_eq!(entry, entry_data.next().unwrap().as_bytes());
+    }
+
+    // reader-2
     assert_eq!(reader2.next()?, None);
 
     // sync
     store.sync()?;
-    assert_eq!(store.sync_seq(), sync_seq0 + 10); // update
-    assert_eq!(reader2.next()?, Some(entries[0].as_bytes()));
+
+    // reader-2
+    let mut entry_data = common::ENTRIES.iter();
+    while let Some(entry) = reader2.next()? {
+        assert_eq!(entry, entry_data.next().unwrap().as_bytes());
+    }
 
     Ok(())
 }

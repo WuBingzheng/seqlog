@@ -1,21 +1,58 @@
-use seqlog::{Result, SeqLog};
+use seqlog::{Error, Result};
+
+mod common;
 
 #[test]
-fn basic() -> Result<()> {
-    let store = SeqLog::open("target/tests-store")?;
+fn readers() -> Result<()> {
+    let mut store = common::open("target/tests-store")?;
 
-    // too big seq
-    assert!(store.reader(store.next_seq() + 1, false).is_err());
+    let next_seq0 = store.next_seq();
 
-    // too small seq
-    assert!(store.reader(0, false).is_err());
+    // invalid reader
+    let Err(err) = store.reader(next_seq0 + 1, false) else {
+        panic!("expect err");
+    };
+    assert!(matches!(err, Error::SeqNotReached(_, _)));
 
-    let mut reader1 = store.reader(store.next_seq() - 1000, false)?;
-    let mut reader2 = store.reader(store.next_seq() - 1000, false)?;
+    // invalid reader
+    let Err(err) = store.reader(99, false) else {
+        panic!("expect err");
+    };
+    assert!(matches!(err, Error::SeqPurged(99, _)));
 
+    // read from end
+    let mut reader1 = store.reader(next_seq0, false)?;
+    let mut reader2 = store.reader(next_seq0, false)?;
+    let mut reader3 = store.reader(next_seq0, true)?;
+    assert_eq!(reader1.next()?, None);
+    assert_eq!(reader2.next()?, None);
+    assert_eq!(reader3.next()?, None);
+
+    // append 100*10 entries
+    for _ in 0..100 {
+        common::append10(&mut store)?;
+    }
+
+    let mut count = 0;
     while let Some(entry) = reader1.next()? {
         assert_eq!(entry, reader2.next()?.unwrap());
+        count += 1;
     }
     assert_eq!(reader2.next()?, None);
+    assert_eq!(count, 1000);
+
+    // sync-reader
+    assert_eq!(reader3.next()?, None);
+    store.sync()?;
+
+    reader1.reset(next_seq0)?;
+    let mut count = 0;
+    while let Some(entry) = reader1.next()? {
+        assert_eq!(entry, reader3.next()?.unwrap());
+        count += 1;
+    }
+    assert_eq!(reader3.next()?, None);
+    assert_eq!(count, 1000);
+
     Ok(())
 }

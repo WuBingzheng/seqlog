@@ -1,17 +1,11 @@
-use seqlog::{Result, SeqLog, SeqLogSyncer};
+use seqlog::{Result, SeqLogSyncer};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
-fn open(dir: &str) -> Result<SeqLog> {
-    if !std::fs::exists(dir)? {
-        SeqLog::create(dir, 100)
-    } else {
-        SeqLog::open(dir)
-    }
-}
+mod common;
 
 #[test]
 fn cross_thread_sync() -> Result<()> {
-    let mut store = open("target/tests-store")?;
+    let mut store = common::open("target/tests-x-sync")?;
 
     let syncer = store.syncer()?;
 
@@ -22,27 +16,13 @@ fn cross_thread_sync() -> Result<()> {
     let next_seq0 = store.next_seq();
     let sync_seq0 = store.sync_seq();
 
-    // append new data
-    let entries = vec![
-        "hello, world!",
-        "111",
-        "222222",
-        "333333333",
-        "444444444444",
-        "555555555555555",
-        "666666666666666666",
-        "777777777777777777777",
-        "888888888888888888888888",
-        "999999999999999999999999999",
-    ];
-
     for _ in 0..10 {
-        store.append(&entries)?;
+        common::append10(&mut store)?;
         let _ = tx.send(());
     }
     std::thread::sleep(std::time::Duration::from_micros(1));
     for _ in 0..10 {
-        store.append(&entries)?;
+        common::append10(&mut store)?;
         let _ = tx.send(());
     }
 
@@ -55,7 +35,7 @@ fn cross_thread_sync() -> Result<()> {
 
 fn sync_back_ground(rx: Receiver<()>, mut syncer: SeqLogSyncer) {
     while let Ok(_) = rx.recv() {
-        // receive all pendings
+        // consume all pendings
         let mut count = 1;
         loop {
             match rx.try_recv() {
@@ -65,6 +45,7 @@ fn sync_back_ground(rx: Receiver<()>, mut syncer: SeqLogSyncer) {
             }
         }
 
+        // then sync
         let _ = syncer.sync();
         println!("--- sync {count}");
     }

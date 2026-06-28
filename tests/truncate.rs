@@ -1,30 +1,12 @@
-use seqlog::{Error, Result, SeqLog};
+use seqlog::{Error, Result};
 
-fn open(dir: &str) -> Result<SeqLog> {
-    if !std::fs::exists(dir)? {
-        SeqLog::create(dir, 100)
-    } else {
-        SeqLog::open(dir)
-    }
-}
+mod common;
 
 #[test]
 fn truncate() -> Result<()> {
     // prepare
-    let mut store = open("target/tests-store")?;
-    let entries = vec![
-        "hello, world!",
-        "111",
-        "222222",
-        "333333333",
-        "444444444444",
-        "555555555555555",
-        "666666666666666666",
-        "777777777777777777777",
-        "888888888888888888888888",
-        "999999999999999999999999999",
-    ];
-    store.append(&entries)?;
+    let mut store = common::open("target/tests-truncate")?;
+    common::append10(&mut store)?;
 
     let next_seq0 = store.next_seq();
 
@@ -45,10 +27,12 @@ fn truncate() -> Result<()> {
     };
     assert!(matches!(err, Error::SeqNotReached(_, _)));
 
-    // read last 13 entries
+    // read last 7 entries
     let mut reader = store.reader(next_seq0 - 10, false)?;
-    for entry in entries[..7].iter() {
-        assert_eq!(reader.next()?, Some(entry.as_bytes()));
+
+    let mut entry_data = common::ENTRIES.iter();
+    while let Some(entry) = reader.next()? {
+        assert_eq!(entry, entry_data.next().unwrap().as_bytes());
     }
     assert_eq!(reader.next()?, None);
     Ok(())

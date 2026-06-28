@@ -302,6 +302,7 @@ impl SeqLog {
         self.current_data.seek(SeekFrom::End(0))?;
 
         // remove indexes in current index file
+        // TODO check index
         let index_file_size = (seq - self.file_seq) / INDEX_INTERVAL * INDEX_SIZE as u64;
         self.current_index.set_len(index_file_size)?;
         self.current_index.seek(SeekFrom::End(0))?;
@@ -661,12 +662,8 @@ fn seek_seq_in_file(
     }
 
     // read data file
-    // TODO optimize, clear the code
     data_buf.resize(READBUF_SIZE, 0);
     let len = data_file.read(data_buf)?;
-    if len == 0 {
-        return Err(Error::DataFileTruncated(file_seq, seq));
-    }
     data_buf.truncate(len);
 
     let mut count = diff_seq % INDEX_INTERVAL;
