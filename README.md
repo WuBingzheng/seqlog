@@ -53,8 +53,7 @@ fn example() -> Result<()> {
 // example().unwrap();
 ```
 
-This is just the basic usage and does not show cross-thread disk
-synchronization and others. See examples for more details.
+This is just the basic usage. See documentation for more details.
 
 
 # Storage Layout
